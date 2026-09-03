@@ -32,7 +32,9 @@ BROWSER_NAMES = {
 # Chromium / Electron apps that honor --proxy-server
 CHROMIUM_LIKE = BROWSER_NAMES | {
     "douyin.exe", "抖音.exe", "tiktok.exe", "douyinlauncher.exe",
+    "aweme_live.exe", "douyinjisu.exe",
     "wechatbrowser.exe", "quark.exe", "ucbrowser.exe",
+    "msedgewebview2.exe",
 }
 
 
@@ -165,6 +167,27 @@ def dll_path():
         if os.path.isfile(p):
             return os.path.abspath(p)
     return None
+
+
+def is_exe_running(exe_path):
+    if not exe_path:
+        return False
+    try:
+        import psutil
+        target = os.path.normcase(os.path.abspath(exe_path))
+        base = os.path.basename(target)
+        for p in psutil.process_iter(["exe", "name"]):
+            try:
+                pexe = p.info.get("exe") or ""
+                if pexe and os.path.normcase(os.path.abspath(pexe)) == target:
+                    return True
+                if not pexe and (p.info.get("name") or "").lower() == base:
+                    return True
+            except (psutil.Error, OSError, ValueError):
+                continue
+    except Exception:
+        return False
+    return False
 
 
 def guess_mode(exe_path):

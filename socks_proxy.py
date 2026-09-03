@@ -28,18 +28,34 @@ class AdapterProxy(object):
         self._stop = threading.Event()
         self._threads = []
 
+    def _tune(self, sock):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        except OSError:
+            pass
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256 * 1024)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024)
+        except OSError:
+            pass
+
     def start(self):
         self._stop.clear()
         self._socks_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._socks_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._tune(self._socks_sock)
         self._socks_sock.bind(("127.0.0.1", 0))
-        self._socks_sock.listen(128)
+        self._socks_sock.listen(256)
         self.socks_port = self._socks_sock.getsockname()[1]
 
         self._http_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._http_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._tune(self._http_sock)
         self._http_sock.bind(("127.0.0.1", 0))
-        self._http_sock.listen(128)
+        self._http_sock.listen(256)
         self.http_port = self._http_sock.getsockname()[1]
 
         t1 = threading.Thread(target=self._accept_loop, args=(self._socks_sock, self._handle_socks), daemon=True)
@@ -71,6 +87,10 @@ class AdapterProxy(object):
                 continue
             except OSError:
                 break
+            try:
+                self._tune(client)
+            except Exception:
+                pass
             t = threading.Thread(target=self._safe, args=(handler, client), daemon=True)
             t.start()
 
@@ -89,6 +109,7 @@ class AdapterProxy(object):
             raise socket.gaierror("no IPv4 address for %s" % host)
         _family, _type, _proto, _canon, sockaddr = infos[0]
         remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._tune(remote)
         remote.settimeout(15)
         if self.bind_ip:
             remote.bind((self.bind_ip, 0))

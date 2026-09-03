@@ -33,8 +33,12 @@ from tkinter import filedialog, messagebox
 
 from adapters import usable_adapters, list_adapters, find_adapter, public_ip_via, KIND_LABELS
 from socks_proxy import ProxyPool
-from launcher import launch_app, list_running_processes, dll_path, guess_mode
+from launcher import launch_app, list_running_processes, dll_path, guess_mode, is_exe_running
 from diagnose import run_selftest
+from winutil import (
+    ensure_single_instance, create_desktop_shortcuts, set_start_with_windows,
+    is_start_with_windows,
+)
 
 APP_NAME = "网口分流"
 APP_NAME_EN = "SplitNIC"
@@ -120,16 +124,25 @@ def relaunch_as_admin():
 
 def load_config():
     if not os.path.isfile(CONFIG_FILE):
-        return {"rules": []}
+        return {"rules": [], "settings": _apply_setting_defaults({})}
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
             return {"rules": []}
         data.setdefault("rules", [])
+        data.setdefault("settings", {})
+        _apply_setting_defaults(data["settings"])
         return data
     except Exception:
-        return {"rules": []}
+        return {"rules": [], "settings": _apply_setting_defaults({})}
+
+
+def _apply_setting_defaults(settings):
+    settings.setdefault("minimize_to_tray", True)
+    settings.setdefault("start_with_windows", False)
+    settings.setdefault("auto_refresh", True)
+    return settings
 
 
 def save_config(data):
@@ -347,6 +360,9 @@ class SplitNICApp(ctk.CTk):
         self.adapters = []
         self.proxy_pool = ProxyPool(log=self.log)
         self._busy = False
+        self._tray = None
+        self._nic_sig = None
+        self._quitting = False
 
         self.font_title = ctk.CTkFont(family="Microsoft YaHei UI", size=22, weight="bold")
         self.font_h = ctk.CTkFont(family="Microsoft YaHei UI", size=15, weight="bold")
@@ -357,6 +373,9 @@ class SplitNICApp(ctk.CTk):
         self.refresh_adapters()
         self.render_rules()
         self.after(200, self._warn_if_needed)
+        self.after(400, self._start_tray)
+        self.after(800, self._schedule_auto_refresh)
+        self.bind("<F5>", lambda e: self.refresh_adapters())
 
     def _build(self):
         header = ctk.CTkFrame(self, fg_color="transparent")
@@ -376,11 +395,13 @@ class SplitNICApp(ctk.CTk):
         self.tab_main = self.tabs.add("分流")
         self.tab_nics = self.tabs.add("网卡详情")
         self.tab_diag = self.tabs.add("诊断")
+        self.tab_settings = self.tabs.add("设置")
         self.tab_help = self.tabs.add("使用说明与注意事项")
 
         self._build_main(self.tab_main)
         self._build_nics(self.tab_nics)
         self._build_diag(self.tab_diag)
+        self._build_settings(self.tab_settings)
         self._build_help(self.tab_help)
 
         log_wrap = ctk.CTkFrame(self)
@@ -454,6 +475,61 @@ class SplitNICApp(ctk.CTk):
         box.insert("1.0", HELP_TEXT)
         box.configure(state="disabled")
 
+    def _settings(self):
+        return self.config_data.setdefault("settings", _apply_setting_defaults({}))
+
+    def _build_settings(self, tab):
+        s = self._settings()
+        wrap = ctk.CTkFrame(tab, fg_color="transparent")
+        wrap.pack(fill="both", expand=True, padx=8, pady=12)
+
+        self.var_tray = ctk.BooleanVar(value=bool(s.get("minimize_to_tray", True)))
+        self.var_auto = ctk.BooleanVar(value=bool(s.get("auto_refresh", True)))
+        self.var_boot = ctk.BooleanVar(value=bool(s.get("start_with_windows", False) or is_start_with_windows()))
+
+        ctk.CTkCheckBox(wrap, text="关闭窗口时最小化到托盘（托盘图标退出才真正关掉）",
+                        variable=self.var_tray, command=self._save_settings).pack(anchor="w", pady=6)
+        ctk.CTkCheckBox(wrap, text="自动刷新网卡（约 20 秒，网卡插拔后不用手点刷新）",
+                        variable=self.var_auto, command=self._save_settings).pack(anchor="w", pady=6)
+        ctk.CTkCheckBox(wrap, text="开机自动启动（管理员，写入当前用户启动文件夹）",
+                        variable=self.var_boot, command=self._toggle_autostart).pack(anchor="w", pady=6)
+
+        ctk.CTkLabel(wrap, text="快捷方式", font=self.font_h).pack(anchor="w", pady=(18, 6))
+        ctk.CTkButton(wrap, text="在桌面创建快捷方式（管理员启动、无黑框）", width=320,
+                      command=self.make_desktop_shortcut).pack(anchor="w", pady=4)
+        ctk.CTkLabel(wrap, text="快捷方式默认以管理员运行、用 pythonw 无控制台窗口。",
+                     font=self.font_small, text_color="gray").pack(anchor="w")
+        ctk.CTkLabel(wrap, text="F5 刷新网卡。再开一次程序会激活已有窗口，不会重复开。",
+                     font=self.font_small, text_color="gray").pack(anchor="w", pady=(8, 0))
+
+    def _save_settings(self):
+        s = self._settings()
+        s["minimize_to_tray"] = bool(self.var_tray.get())
+        s["auto_refresh"] = bool(self.var_auto.get())
+        s["start_with_windows"] = bool(self.var_boot.get())
+        save_config(self.config_data)
+
+    def _toggle_autostart(self):
+        enabled = bool(self.var_boot.get())
+        try:
+            path = set_start_with_windows(enabled)
+            self._save_settings()
+            if enabled:
+                self.log("已写入开机启动：%s" % path)
+            else:
+                self.log("已取消开机启动")
+        except Exception as exc:
+            self.var_boot.set(not enabled)
+            messagebox.showerror(APP_NAME, "设置开机启动失败：%s" % exc)
+
+    def make_desktop_shortcut(self):
+        try:
+            created = create_desktop_shortcuts(run_as_admin=True)
+            self.log("已创建桌面快捷方式：%s" % " ； ".join(created))
+            messagebox.showinfo(APP_NAME, "已在桌面创建「网口分流」快捷方式。\n双击会请求管理员权限。")
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, "创建快捷方式失败：%s" % exc)
+
     def log(self, msg):
         def _append():
             try:
@@ -473,16 +549,25 @@ class SplitNICApp(ctk.CTk):
         except Exception:
             pass
 
-    def refresh_adapters(self):
+    def refresh_adapters(self, silent=False):
         try:
             self.adapters = usable_adapters()
             all_nics = list_adapters(include_down=True, include_loopback=False)
         except Exception as exc:
-            self.log("读取网卡失败：%s" % exc)
+            if not silent:
+                self.log("读取网卡失败：%s" % exc)
             self.adapters = []
             all_nics = []
-        self._render_nic_cards()
-        self._render_nic_details(all_nics)
+        sig = tuple((a.get("guid"), a.get("up"), tuple(a.get("ipv4") or [])) for a in self.adapters)
+        changed = sig != self._nic_sig
+        self._nic_sig = sig
+        if not silent or changed:
+            self._render_nic_cards()
+            self._render_nic_details(all_nics)
+            if changed and silent:
+                self.render_rules()
+        if silent and not changed:
+            return
         up = [a for a in self.adapters if a.get("up") and a.get("ipv4")]
         if len(up) < 2:
             self.log("当前已连接且有 IPv4 的网卡不足 2 张。请同时连接有线网和无线网（或 VPN）后再刷新。")
@@ -543,7 +628,7 @@ class SplitNICApp(ctk.CTk):
             return
         header = ctk.CTkFrame(self.rule_box, fg_color="transparent")
         header.pack(fill="x", pady=(0, 4))
-        for text, width in (("软件", 180), ("网卡", 220), ("模式", 110), ("路径", 360)):
+        for text, width in (("软件", 180), ("网卡", 200), ("模式", 90), ("状态", 70), ("路径", 300)):
             ctk.CTkLabel(header, text=text, width=width, anchor="w",
                          font=self.font_small, text_color="gray").pack(side="left")
 
@@ -571,8 +656,11 @@ class SplitNICApp(ctk.CTk):
         ctk.CTkLabel(row, text=nic_text, width=220, anchor="w", font=self.font,
                      text_color=nic_color).pack(side="left")
         ctk.CTkLabel(row, text=MODE_LABELS.get(rule.get("mode") or "auto", "自动"),
-                     width=110, anchor="w", font=self.font).pack(side="left")
-        ctk.CTkLabel(row, text=rule.get("exe") or "", width=360, anchor="w",
+                     width=90, anchor="w", font=self.font).pack(side="left")
+        running = is_exe_running(rule.get("exe") or "")
+        ctk.CTkLabel(row, text="运行中" if running else "未运行", width=70, anchor="w",
+                     font=self.font_small, text_color="#22c55e" if running else "gray").pack(side="left")
+        ctk.CTkLabel(row, text=rule.get("exe") or "", width=300, anchor="w",
                      font=self.font_small, text_color="gray").pack(side="left")
 
         btns = ctk.CTkFrame(row, fg_color="transparent")
@@ -754,15 +842,77 @@ class SplitNICApp(ctk.CTk):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _schedule_auto_refresh(self):
+        if self._quitting:
+            return
+        try:
+            if self._settings().get("auto_refresh", True):
+                self.refresh_adapters(silent=True)
+        except Exception:
+            pass
+        if not self._quitting:
+            self.after(20000, self._schedule_auto_refresh)
+
+    def _start_tray(self):
+        try:
+            import pystray
+            from PIL import Image
+            icon_path = os.path.join(HERE, "assets", "icon.ico")
+            try:
+                image = Image.open(icon_path) if os.path.isfile(icon_path) else Image.new("RGB", (64, 64), (59, 130, 246))
+            except Exception:
+                image = Image.new("RGB", (64, 64), (59, 130, 246))
+            menu = pystray.Menu(
+                pystray.MenuItem("打开主窗口", lambda: self.after(0, self.show_from_tray), default=True),
+                pystray.MenuItem("启动全部规则", lambda: self.after(0, self.start_all)),
+                pystray.MenuItem("刷新网卡", lambda: self.after(0, self.refresh_adapters)),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("退出", lambda: self.after(0, self.quit_app)),
+            )
+            self._tray = pystray.Icon("SplitNIC", image, "网口分流", menu)
+            self._tray.run_detached()
+        except ImportError:
+            self.log("未安装 pystray，托盘不可用。可执行：python -m pip install pystray")
+            self._tray = None
+        except Exception as exc:
+            self.log("托盘启动失败：%s" % exc)
+            self._tray = None
+
+    def show_from_tray(self):
+        try:
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+        except Exception:
+            pass
+
     def on_close(self):
+        if not self._quitting and self._settings().get("minimize_to_tray", True) and self._tray:
+            self.withdraw()
+            self.log("已最小化到托盘。要退出请右键托盘图标选「退出」。")
+            return
+        self.quit_app()
+
+    def quit_app(self):
+        self._quitting = True
+        try:
+            if self._tray:
+                self._tray.stop()
+        except Exception:
+            pass
         try:
             self.proxy_pool.stop_all()
         except Exception:
             pass
-        self.destroy()
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
 
 def main():
+    if not ensure_single_instance():
+        return
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
     app = SplitNICApp()
