@@ -38,6 +38,13 @@ Write-Host "Compiling BindHook.dll ..."
 if ($LASTEXITCODE -ne 0) { throw "tcc failed with $LASTEXITCODE" }
 Write-Host "OK  $dll"
 
+$dropSrc = Join-Path $Root "native\dropglass.c"
+$dropDll = Join-Path $Root "native\DropGlass.dll"
+Write-Host "Compiling DropGlass.dll ..."
+& $TccExe -shared -o $dropDll $dropSrc -lkernel32 -luser32 -lshell32 -lgdi32
+if ($LASTEXITCODE -ne 0) { throw "tcc DropGlass failed with $LASTEXITCODE" }
+Write-Host "OK  $dropDll"
+
 Write-Host "Generating icon ..."
 python -c @"
 from PIL import Image, ImageDraw

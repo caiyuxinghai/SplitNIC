@@ -10,6 +10,7 @@ always answers DROPEFFECT_COPY, and extracts CF_HDROP (desktop .lnk included).
 """
 from __future__ import print_function
 
+import os
 import ctypes
 from ctypes import wintypes as wt
 
@@ -362,6 +363,14 @@ class _Target(object):
         return ctypes.c_void_p(self.addr)
 
 
+_DropCb = ctypes.WINFUNCTYPE(None, wt.LPCWSTR, ctypes.c_int, ctypes.c_int, ctypes.c_int)
+
+
+def _dll_path():
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(here, "native", "DropGlass.dll")
+
+
 class OleDropSite(object):
     def __init__(self, root, on_drop, on_over=None, on_leave=None):
         self.root = root
@@ -372,6 +381,96 @@ class OleDropSite(object):
         self._hwnds = set()
         self._enum_cb = None
         self.last_error = ""
+        self._dll = None
+        self._dll_cb = None
+        self._use_dll = False
+
+    def _on_dll(self, files, x, y, kind):
+        text = "%s" % (files or "")
+        paths = [p for p in text.split("\n") if p]
+        xx, yy, kk = int(x), int(y), int(kind)
+
+        def go(paths=paths, xx=xx, yy=yy, kk=kk):
+            try:
+                if kk == 1:
+                    self.on_drop(paths, xx, yy)
+                elif kk == 2:
+                    if self.on_leave:
+                        self.on_leave()
+                elif kk == 0 and self.on_over:
+                    self.on_over(xx, yy)
+            except Exception:
+                pass
+
+        try:
+            if kk == 0:
+                if getattr(self, "_over_pending", False):
+                    return
+                self._over_pending = True
+
+                def over():
+                    self._over_pending = False
+                    go()
+
+                self.root.after(40, over)
+            else:
+                self.root.after(0, go)
+        except Exception:
+            go()
+
+    def _install_dll(self, hwnd):
+        path = _dll_path()
+        if not os.path.isfile(path):
+            self.last_error = "no DropGlass.dll"
+            return 0
+        if self._dll is None:
+            self._dll = ctypes.WinDLL(path)
+            self._dll.SplitNIC_DropInstall.argtypes = [wt.HWND, _DropCb]
+            self._dll.SplitNIC_DropInstall.restype = ctypes.c_int
+            self._dll.SplitNIC_DropRefresh.argtypes = []
+            self._dll.SplitNIC_DropRefresh.restype = ctypes.c_int
+            self._dll_cb = _DropCb(self._on_dll)
+        n = int(self._dll.SplitNIC_DropInstall(hwnd, self._dll_cb) or 0)
+        self._use_dll = n > 0
+        if n:
+            self._hwnds.add(int(hwnd))
+            if not getattr(self, "_poll_started", False):
+                self._poll_started = True
+                self.root.after(120, self._poll_inbox)
+        else:
+            self.last_error = "DropGlass install returned 0"
+        return n
+
+    def _poll_inbox(self):
+        path = os.path.join(os.environ.get("APPDATA", "."), "SplitNIC", "drop-inbox.txt")
+        try:
+            if os.path.isfile(path):
+                raw = open(path, "rb").read()
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+                text = raw.decode("utf-16le", "ignore")
+                lines = [ln.strip("\ufeff") for ln in text.splitlines()]
+                kind = (lines[0] if lines else "").strip()
+                try:
+                    x = int(lines[1]) if len(lines) > 1 else 0
+                    y = int(lines[2]) if len(lines) > 2 else 0
+                except Exception:
+                    x, y = 0, 0
+                files = [ln.strip() for ln in lines[3:] if ln.strip()]
+                if kind == "DROP" and self.on_drop:
+                    self.on_drop(files, x, y)
+                elif kind == "OVER" and self.on_over:
+                    self.on_over(x, y)
+                elif kind == "LEAVE" and self.on_leave:
+                    self.on_leave()
+        except Exception:
+            pass
+        try:
+            self.root.after(120, self._poll_inbox)
+        except Exception:
+            pass
 
     def install(self):
         """Register IDropTarget on every HWND. Safe to call again after layout."""
@@ -386,6 +485,17 @@ class OleDropSite(object):
         if not hwnd:
             self.last_error = "no hwnd"
             return 0
+        dll_n = 0
+        try:
+            dll_n = self._install_dll(hwnd)
+        except Exception as exc:
+            self.last_error = "DropGlass: %s" % exc
+        if self._use_dll:
+            try:
+                extra = int(self._dll.SplitNIC_DropRefresh() or 0)
+            except Exception:
+                extra = 0
+            return dll_n + extra
         hwnds, self._enum_cb = enum_hwnds(hwnd)
         for old in list(self._hwnds):
             if not user32.IsWindow(old):

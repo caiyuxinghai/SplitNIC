@@ -1,4 +1,8 @@
-# BindHook.dll
+# Native modules
+
+`DropGlass.dll` — OLE IDropTarget overlay so Explorer can drop desktop shortcuts onto the GUI.
+
+`BindHook.dll` — injected into a 64-bit target process.
 
 `bindhook.c` is injected into a 64-bit target process and forces Winsock
 sockets onto the interface given by:
