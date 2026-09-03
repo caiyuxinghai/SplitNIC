@@ -32,6 +32,19 @@ except Exception:
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
+try:
+    from tkinterdnd2 import TkinterDnD
+
+    class CTkRoot(ctk.CTk, TkinterDnD.DnDWrapper):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.TkdndVersion = TkinterDnD._require(self)
+
+    HAS_DND = True
+except Exception:
+    CTkRoot = ctk.CTk
+    HAS_DND = False
+
 from adapters import usable_adapters, list_adapters, find_adapter, public_ip_via, KIND_LABELS
 from socks_proxy import ProxyPool
 from launcher import (
@@ -39,6 +52,7 @@ from launcher import (
     is_rule_running, stop_rule_processes,
 )
 from diagnose import run_selftest
+from simple_board import SimpleBoard
 from winutil import (
     ensure_single_instance, create_desktop_shortcuts, set_start_with_windows,
     is_start_with_windows, create_rule_shortcut, create_all_rule_shortcuts,
@@ -77,9 +91,9 @@ HELP_TEXT = """\
 【怎么用】
 1. 先用管理员身份打开本程序（绑定网卡需要管理员权限）。
 2. 确认顶部「可用网卡」里至少有 2 张已连接、有 IPv4 的网卡。
-3. 点「添加软件」，选 exe，再选要走的网卡。
-4. 点规则上的「快捷方式」，桌面会生成「软件名（有线网/无线网）」图标。以后请双击这个图标，不要用软件原来的桌面图标。
-5. 也可以在本程序里点「启动」。浏览器、抖音建议「自动/浏览器代理」；WorkBuddy、VPN 选「网卡绑定」。
+3. 默认是简洁模式：把软件拖到「有线网」或「无线网」方块里，点图标就能启动。
+4. 右上角「高级模式」才是原来的表格、诊断和手动配置。
+5. 右键图标可以放到桌面、改详细设置或移除。
 
 【启动模式】
   · 自动：浏览器走本地代理，其它程序尝试网卡绑定（注入 BindHook.dll）。
@@ -371,13 +385,15 @@ class RuleEditor(ctk.CTkToplevel):
         self.destroy()
 
 
-class SplitNICApp(ctk.CTk):
+class SplitNICApp(CTkRoot):
     def __init__(self, pending_cmds=None, start_minimized=False):
         super().__init__()
         self.title("%s  %s" % (APP_NAME, APP_NAME_EN))
-        self.geometry("1240x800")
-        self.minsize(1040, 660)
-        self.configure(fg_color=("#f4f6fb", "#0f1419"))
+        self.geometry("1280x760")
+        self.minsize(980, 620)
+        self.configure(fg_color="#0b0e14")
+        self._has_dnd = HAS_DND
+        self._advanced = False
         icon_path = os.path.join(HERE, "assets", "icon.ico")
         if os.path.isfile(icon_path):
             try:
@@ -402,7 +418,7 @@ class SplitNICApp(ctk.CTk):
         self._wait_since = {}
         self._started_at = time.time()
 
-        self.font_title = ctk.CTkFont(family="Microsoft YaHei UI", size=22, weight="bold")
+        self.font_title = ctk.CTkFont(family="Microsoft YaHei UI", size=26, weight="bold")
         self.font_h = ctk.CTkFont(family="Microsoft YaHei UI", size=15, weight="bold")
         self.font = ctk.CTkFont(family="Microsoft YaHei UI", size=13)
         self.font_small = ctk.CTkFont(family="Microsoft YaHei UI", size=12)
@@ -421,18 +437,29 @@ class SplitNICApp(ctk.CTk):
 
     def _build(self):
         header = ctk.CTkFrame(self, fg_color="transparent")
-        header.pack(fill="x", padx=22, pady=(16, 6))
-        ctk.CTkLabel(header, text=APP_NAME, font=self.font_title).pack(side="left")
-        ctk.CTkLabel(header, text="  按软件选择走有线网还是无线网",
-                     font=self.font, text_color="gray").pack(side="left", padx=(8, 0), pady=(8, 0))
+        header.pack(fill="x", padx=28, pady=(18, 8))
+        ctk.CTkLabel(header, text=APP_NAME, font=self.font_title, text_color="#f8fafc").pack(side="left")
 
-        self.admin_pill = ctk.CTkLabel(header, text="", font=self.font_small, width=160)
-        self.admin_pill.pack(side="right")
-        self.btn_elevate = ctk.CTkButton(header, text="获取管理员权限", width=130, command=self.elevate)
-        self.btn_elevate.pack(side="right", padx=8)
+        self.btn_mode = ctk.CTkButton(
+            header, text="高级模式", width=96, height=34, corner_radius=10,
+            fg_color="#1e293b", hover_color="#334155", text_color="#e2e8f0",
+            command=self.toggle_advanced,
+        )
+        self.btn_mode.pack(side="right")
+        self.admin_pill = ctk.CTkLabel(header, text="", font=self.font_small, width=120)
+        self.admin_pill.pack(side="right", padx=10)
+        self.btn_elevate = ctk.CTkButton(
+            header, text="管理员", width=84, height=34, corner_radius=10,
+            fg_color="#1e293b", hover_color="#334155", command=self.elevate,
+        )
+        self.btn_elevate.pack(side="right", padx=(0, 6))
         self._set_admin_pill()
 
-        self.tabs = ctk.CTkTabview(self)
+        self.simple_board = SimpleBoard(self, self)
+        self.simple_board.pack(fill="both", expand=True, padx=24, pady=(0, 18))
+
+        self.advanced_wrap = ctk.CTkFrame(self, fg_color="transparent")
+        self.tabs = ctk.CTkTabview(self.advanced_wrap)
         self.tabs.pack(fill="both", expand=True, padx=18, pady=(0, 8))
         self.tab_main = self.tabs.add("分流")
         self.tab_nics = self.tabs.add("网卡详情")
@@ -446,25 +473,72 @@ class SplitNICApp(ctk.CTk):
         self._build_settings(self.tab_settings)
         self._build_help(self.tab_help)
 
-        log_wrap = ctk.CTkFrame(self)
-        log_wrap.pack(fill="x", padx=18, pady=(0, 14))
-        ctk.CTkLabel(log_wrap, text="运行日志", font=self.font_h).pack(anchor="w", padx=10, pady=(8, 0))
-        self.log_box = ctk.CTkTextbox(log_wrap, height=120, font=self.font_small)
+        self.log_wrap = ctk.CTkFrame(self.advanced_wrap, fg_color="#141a22")
+        ctk.CTkLabel(self.log_wrap, text="运行日志", font=self.font_h).pack(anchor="w", padx=10, pady=(8, 0))
+        self.log_box = ctk.CTkTextbox(self.log_wrap, height=120, font=self.font_small)
         self.log_box.pack(fill="x", padx=10, pady=(4, 10))
         self.log_box.configure(state="disabled")
+        self.log_wrap.pack(fill="x", padx=18, pady=(0, 14))
 
     def _set_admin_pill(self):
         if is_admin():
-            self.admin_pill.configure(text="管理员  已获得", text_color="#22c55e")
+            self.admin_pill.configure(text="管理员", text_color="#34d399")
             self.btn_elevate.pack_forget()
         else:
-            self.admin_pill.configure(text="非管理员  网卡绑定可能失败", text_color="#f59e0b")
+            self.admin_pill.configure(text="未提权", text_color="#fbbf24")
 
     def elevate(self):
         if relaunch_as_admin():
             self.on_close()
         else:
             messagebox.showerror(APP_NAME, "提权失败。请右键「启动网口分流.bat」选择以管理员身份运行。")
+
+    def toggle_advanced(self):
+        self._advanced = not self._advanced
+        if self._advanced:
+            self.simple_board.pack_forget()
+            self.advanced_wrap.pack(fill="both", expand=True, padx=0, pady=0)
+            self.btn_mode.configure(text="简洁模式")
+            self._render_rule_table()
+        else:
+            self.advanced_wrap.pack_forget()
+            self.simple_board.pack(fill="both", expand=True, padx=24, pady=(0, 18))
+            self.btn_mode.configure(text="高级模式")
+            self.simple_board.refresh()
+
+    def add_exe_to_adapter(self, adapter, exe_path=None):
+        if not exe_path:
+            exe_path = filedialog.askopenfilename(
+                parent=self, title="选择要放到「%s」的程序" % (adapter.get("name") or "这张网"),
+                filetypes=[("程序", "*.exe"), ("全部文件", "*.*")],
+            )
+        if not exe_path or not os.path.isfile(exe_path):
+            return
+        name = os.path.splitext(os.path.basename(exe_path))[0]
+        rule = new_rule(
+            name=name, exe=exe_path, mode=guess_mode(exe_path),
+            adapter_guid=adapter.get("guid") or "",
+            adapter_name=adapter.get("name") or "",
+            adapter_kind=adapter.get("kind") or "",
+        )
+        self.config_data.setdefault("rules", []).append(rule)
+        self.persist()
+        self.log("已放到 %s：%s" % (adapter.get("name"), name))
+        if hasattr(self, "simple_board"):
+            self.simple_board.set_status("已添加 %s → %s，点图标即可启动" % (name, adapter.get("name")))
+
+    def assign_rule_to_adapter(self, rule, adapter):
+        rid = rule.get("id")
+        for r in self.config_data.get("rules") or []:
+            if r.get("id") == rid:
+                r["adapter_guid"] = adapter.get("guid") or ""
+                r["adapter_name"] = adapter.get("name") or ""
+                r["adapter_kind"] = adapter.get("kind") or ""
+                break
+        self.persist()
+        self.log("%s → %s" % (rule.get("name"), adapter.get("name")))
+        if hasattr(self, "simple_board"):
+            self.simple_board.set_status("%s 现在走 %s" % (rule.get("name"), adapter.get("name")))
 
     def _build_main(self, tab):
         ctk.CTkLabel(tab, text="可用网卡", font=self.font_h).pack(anchor="w", pady=(4, 4))
@@ -732,6 +806,14 @@ class SplitNICApp(ctk.CTk):
                          anchor="w").pack(anchor="w", padx=12, pady=(2, 10))
 
     def render_rules(self):
+        if getattr(self, "_advanced", False):
+            self._render_rule_table()
+        elif hasattr(self, "simple_board"):
+            self.simple_board.refresh()
+
+    def _render_rule_table(self):
+        if not hasattr(self, "rule_box"):
+            return
         for w in self.rule_box.winfo_children():
             w.destroy()
         rules = self.config_data.get("rules") or []
@@ -1228,7 +1310,7 @@ def main():
             bring_existing_to_front()
         return
     ctk.set_appearance_mode("dark")
-    ctk.set_default_color_theme("blue")
+    ctk.set_default_color_theme("dark-blue")
     app = SplitNICApp(pending_cmds=cmds, start_minimized=minimized)
     app.protocol("WM_DELETE_WINDOW", app.on_close)
     app.mainloop()
