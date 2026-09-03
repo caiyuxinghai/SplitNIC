@@ -84,9 +84,10 @@ HELP_TEXT = """\
   · 无线网  →  抖音、Chrome / Edge / 浏览器
 
 【怎么用】
-1. 用普通方式打开（不要「以管理员运行」）。管理员窗口会被 Windows 禁止从桌面拖入图标。
-2. 确认顶部同时出现有线网和无线网。
-3. 把桌面上的应用快捷方式拖到对应网络卡片里，点图标就能启动。网卡绑定失败时再点右上角「管理员」。
+1. 用普通方式打开（不要「以管理员运行」），否则拖不进桌面图标。
+2. 确认同时出现有线网和无线网。
+3. 把抖音 / Chrome / WorkBuddy 的桌面快捷方式拖进对应卡片，会自动找到 .exe 并用这张网启动。
+4. 图标上出现「出口 x.x.x.x」才表示分流成功。以后都从本窗口点图标打开。
 4. 右上角「高级模式」才是原来的表格、诊断和手动配置。
 5. 右键图标可以放到桌面、改详细设置或移除。
 
@@ -98,7 +99,7 @@ HELP_TEXT = """\
 
 【必须知道的限制】
   · 微软商店 UWP 应用无法分流。
-  · 带反作弊的游戏往往会拒绝 DLL 注入，请不要对这类程序使用「网卡绑定」。
+  · 无畏契约、星穹铁道、三角洲行动等带反作弊的游戏不能分流，请走系统默认网卡。
   · 启动后规则上会显示「出口 x.x.x.x」，那是这张网卡测到的公网 IP，用来确认有没有走对。
   · 开机启动会带上「按规则自动拉起软件」。网卡重新插上后，也会自动启动勾了「自动启动」且当时没在运行的软件。
   · Chrome / Edge / 抖音默认使用独立配置目录，和日常浏览器分开，不必先关掉你正在用的那个。
@@ -421,6 +422,7 @@ class SplitNICApp(ctk.CTkFrame):
         self._drop_guard = (0, ())
         self.after(200, self._warn_if_needed)
         self.after(300, self._install_native_drop)
+        self.after(1600, self._probe_nic_egress)
         self.after(800, self._ensure_normal_shortcut)
         self.after(400, self._start_tray)
         self.after(700, self._poll_ipc)
@@ -506,6 +508,16 @@ class SplitNICApp(ctk.CTkFrame):
             pass
 
     def _install_native_drop(self):
+        job = getattr(self, "_ole_job", None)
+        if job is not None:
+            try:
+                self.after_cancel(job)
+            except Exception:
+                pass
+        self._ole_job = self.after(180, self._install_native_drop_now)
+
+    def _install_native_drop_now(self):
+        self._ole_job = None
         try:
             from ole_drop import OleDropSite
         except Exception as exc:
@@ -855,6 +867,10 @@ class SplitNICApp(ctk.CTkFrame):
                 self.log_box.insert("end", msg + "\n")
                 self.log_box.see("end")
                 self.log_box.configure(state="disabled")
+                if (not getattr(self, "_advanced", False)
+                        and hasattr(self, "simple_board")
+                        and any(k in msg for k in ("已启动", "出口", "已找到", "失败", "不能"))):
+                    self.simple_board.set_status(msg)
             except Exception:
                 pass
         try:
@@ -1313,6 +1329,28 @@ class SplitNICApp(ctk.CTkFrame):
                     self.log("  %s (%s, %s)  测试失败：%s" % (a["name"], a["kind_label"], ip, exc))
             self.log("公网 IP 测试结束。两张网卡如果公网 IP 不同，说明分流有物理基础。")
             self.after(0, self._render_nic_cards)
+            self.after(0, self.render_rules)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _probe_nic_egress(self):
+        nics = [a for a in (self.adapters or []) if a.get("up") and a.get("ipv4")]
+        if not nics:
+            return
+
+        def work():
+            for a in nics:
+                guid = a.get("guid")
+                if not guid or guid in self._adapter_pub:
+                    continue
+                try:
+                    pub = public_ip_via(a["ipv4"][0], a["if_index"], timeout=5)
+                    self._adapter_pub[guid] = pub
+                    self.log("%s 公网出口 %s" % (a.get("network_name") or a.get("name"), pub))
+                except Exception as exc:
+                    self.log("%s 公网探测失败：%s" % (a.get("name"), exc))
+            self.after(0, self._render_nic_cards)
+            self.after(0, self.render_rules)
 
         threading.Thread(target=work, daemon=True).start()
 

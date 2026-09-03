@@ -430,6 +430,11 @@ class OleDropSite(object):
             self._dll.SplitNIC_DropRefresh.argtypes = []
             self._dll.SplitNIC_DropRefresh.restype = ctypes.c_int
             self._dll_cb = _DropCb(self._on_dll)
+        if self._use_dll:
+            try:
+                return int(self._dll.SplitNIC_DropRefresh() or 0)
+            except Exception:
+                return 0
         n = int(self._dll.SplitNIC_DropInstall(hwnd, self._dll_cb) or 0)
         self._use_dll = n > 0
         if n:

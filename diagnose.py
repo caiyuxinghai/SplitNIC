@@ -32,7 +32,7 @@ def run_selftest(include_inject=True):
         admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
         admin = False
-    lines.append(_ok("管理员权限") if admin else _info("当前不是管理员（浏览器代理仍可用，网卡绑定可能失败）"))
+    lines.append(_ok("管理员权限") if admin else _info("普通权限（可拖入桌面图标；浏览器代理不需要管理员）"))
 
     from launcher import dll_path
     hook = dll_path()
@@ -46,6 +46,25 @@ def run_selftest(include_inject=True):
             del h
         except Exception as exc:
             lines.append(_fail("LoadLibrary(BindHook.dll) 失败：%s" % exc))
+
+    dropdll = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native", "DropGlass.dll")
+    if os.path.isfile(dropdll):
+        lines.append(_ok("DropGlass.dll  " + dropdll))
+    else:
+        lines.append(_fail("找不到 DropGlass.dll，桌面拖放可能失败"))
+
+    try:
+        from launcher import _env_block
+        import ctypes as _ct
+        buf = _env_block({"SPLITNIC_BIND_IP": "10.0.0.1", "SPLITNIC_IFINDEX": "9"})
+        raw = _ct.string_at(buf, len(buf.raw)).decode("utf-16le", "replace")
+        vars_ = [x for x in raw.split("\x00") if x]
+        if any(v.startswith("SPLITNIC_BIND_IP=10.0.0.1") for v in vars_) and len(vars_) > 10:
+            lines.append(_ok("启动环境块含绑定 IP，共 %d 项" % len(vars_)))
+        else:
+            lines.append(_fail("启动环境块缺少 SPLITNIC_BIND_IP（分流会走默认网卡）"))
+    except Exception as exc:
+        lines.append(_fail("环境块自检失败：%s" % exc))
 
     from adapters import list_adapters, usable_adapters, apply_unicast_if
     try:
@@ -127,6 +146,15 @@ def run_selftest(include_inject=True):
                 time.sleep(1.2)
                 if psutil.pid_exists(pid):
                     lines.append(_ok("向 notepad.exe 注入 BindHook 后进程仍存活 PID %s" % pid))
+                    try:
+                        env = psutil.Process(pid).environ()
+                        got = env.get("SPLITNIC_BIND_IP")
+                        if got == a["ipv4"][0]:
+                            lines.append(_ok("notepad 环境 SPLITNIC_BIND_IP=%s" % got))
+                        else:
+                            lines.append(_fail("notepad 环境没有绑定 IP（实际 %r），分流不会生效" % got))
+                    except Exception as exc:
+                        lines.append(_info("读 notepad 环境失败：%s" % exc))
                 else:
                     lines.append(_fail("向 notepad.exe 注入后进程立刻退出，挂钩仍可能有问题"))
             except Exception as exc:

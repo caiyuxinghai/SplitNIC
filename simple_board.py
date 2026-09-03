@@ -7,7 +7,7 @@ import tkinter as tk
 import customtkinter as ctk
 
 from icons import exe_icon, placeholder_icon
-from launcher import is_rule_running
+from launcher import is_rule_running, guess_mode, has_anticheat
 
 KIND_STYLE = {
     "wired": {"color": "#3ee0a0", "soft": "#163328", "title": "有线网", "hint": "WorkBuddy、VPN 拖到这里"},
@@ -36,7 +36,7 @@ class SimpleBoard(ctk.CTkFrame):
 
         self.hint = ctk.CTkLabel(
             self,
-            text="拖进快捷方式会自动找到对应 .exe 并用这张网启动  ·  不要从桌面再开一次",
+            text="把抖音 / 浏览器 / WorkBuddy 拖进对应网络  ·  图标上的「出口 IP」能对上才算分成功",
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=15),
             text_color="#9fb0c8",
         )
@@ -46,7 +46,7 @@ class SimpleBoard(ctk.CTkFrame):
         self.body.pack(fill="both", expand=True)
 
         self.status = ctk.CTkLabel(
-            self, text="支持直接拖桌面上的快捷方式（抖音、Chrome…）",
+            self, text="游戏（无畏契约、星穹铁道、三角洲）带反作弊，不能分流",
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=13),
             text_color="#6b7c93",
         )
@@ -150,7 +150,7 @@ class SimpleBoard(ctk.CTkFrame):
         ).pack(anchor="w", pady=(2, 0))
         ip = (adapter.get("ipv4") or ["-"])[0]
         pub = self.ctrl._adapter_pub.get(adapter.get("guid"))
-        sub = ip if not pub else "%s   出口 %s" % (ip, pub)
+        sub = ip if not pub else "%s  ·  这张网出口 %s" % (ip, pub)
         ctk.CTkLabel(head, text=sub, anchor="w", text_color="#64748b",
                      font=ctk.CTkFont(family="Consolas", size=13)).pack(anchor="w", pady=(2, 0))
 
@@ -285,25 +285,45 @@ class SimpleBoard(ctk.CTkFrame):
         self._icon_cache[path] = cimg
         return cimg
 
+    def _tile_caption(self, rule, running):
+        exe = rule.get("exe") or ""
+        if has_anticheat(exe):
+            return "不能分流", "#f87171"
+        eg = (getattr(self.ctrl, "_egress", {}) or {}).get(rule.get("id") or "") or {}
+        if running and eg.get("ip"):
+            return "出口 %s" % eg["ip"], "#34d399"
+        if running:
+            return "运行中", "#34d399"
+        mode = rule.get("mode") or "auto"
+        if mode == "auto":
+            mode = guess_mode(exe)
+        if mode == "proxy":
+            return "代理启动", "#38bdf8"
+        if mode == "bind":
+            return "绑定启动", "#a3e635"
+        return "点击启动", "#64748b"
+
     def _make_tile(self, parent, rule, adapter):
         running = is_rule_running(rule)
-        tile = ctk.CTkFrame(parent, width=108, height=124, fg_color=BG_TILE, corner_radius=16)
+        blocked = has_anticheat(rule.get("exe") or "")
+        tile = ctk.CTkFrame(parent, width=118, height=132, fg_color=BG_TILE, corner_radius=16)
         tile.pack_propagate(False)
         tile._rule = rule
         img = self._ctk_image(rule.get("exe") or "")
         icon_lbl = ctk.CTkLabel(tile, image=img, text="")
-        icon_lbl.pack(pady=(14, 4))
+        icon_lbl.pack(pady=(12, 2))
         name = rule.get("name") or os.path.splitext(os.path.basename(rule.get("exe") or ""))[0]
         if len(name) > 9:
             name = name[:8] + "…"
         ctk.CTkLabel(
             tile, text=name, font=ctk.CTkFont(family="Microsoft YaHei UI", size=13),
-            text_color="#f1f5f9",
+            text_color="#94a3b8" if blocked else "#f1f5f9",
         ).pack()
+        caption, color = self._tile_caption(rule, running)
         ctk.CTkLabel(
-            tile, text="运行中" if running else "点击启动",
+            tile, text=caption,
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=11),
-            text_color="#34d399" if running else "#64748b",
+            text_color=color,
         ).pack()
 
         for w in (tile, icon_lbl):

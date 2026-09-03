@@ -532,7 +532,7 @@ static HWND create_glass(HWND parent)
         typedef BOOL(WINAPI *PFN_SLWA)(HWND, COLORREF, BYTE, DWORD);
         PFN_SLWA slwa = (PFN_SLWA)GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetLayeredWindowAttributes");
         if (slwa)
-            slwa(glass, 0, 12, LWA_ALPHA);
+            slwa(glass, 0, 1, LWA_ALPHA);
     }
     SetWindowPos(glass, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     return glass;
@@ -560,7 +560,7 @@ __declspec(dllexport) int __stdcall SplitNIC_DropInstall(HWND parent, DropCb cb)
 
     if (register_hwnd(parent))
         n++;
-    EnumChildWindows(parent, enum_cb, (LPARAM)&n);
+    /* Glass covers the client; no need to RegisterDragDrop on every CTk child. */
 
     if (!g_glass || !IsWindow(g_glass)) {
         g_glass = create_glass(parent);
@@ -576,19 +576,13 @@ __declspec(dllexport) int __stdcall SplitNIC_DropInstall(HWND parent, DropCb cb)
 
 __declspec(dllexport) int __stdcall SplitNIC_DropRefresh(void)
 {
-    int n = 0;
-    if (!g_parent || !IsWindow(g_parent))
+    if (!g_parent || !IsWindow(g_parent) || !g_glass || !IsWindow(g_glass))
         return 0;
-    if (register_hwnd(g_parent))
-        n++;
-    EnumChildWindows(g_parent, enum_cb, (LPARAM)&n);
-    if (g_glass && IsWindow(g_glass)) {
+    {
         RECT rc;
         GetClientRect(g_parent, &rc);
         MoveWindow(g_glass, 0, 0, rc.right - rc.left, rc.bottom - rc.top, TRUE);
         SetWindowPos(g_glass, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        if (register_hwnd(g_glass))
-            n++;
     }
-    return n;
+    return 0;
 }
