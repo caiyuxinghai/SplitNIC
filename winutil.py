@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Windows helpers: single-instance, desktop shortcuts, autostart."""
+"""Windows helpers: single-instance, desktop shortcuts, autostart, IPC."""
 from __future__ import print_function
 
 import os
 import sys
+import json
 import ctypes
 from ctypes import wintypes as wt
 
@@ -20,6 +21,14 @@ WINDOW_TITLE = "网口分流  SplitNIC"
 MUTEX_NAME = "Local\\SplitNIC.SingleInstance.v2"
 
 _mutex_handle = None
+
+KIND_SHORT = {
+    "wired": "有线网",
+    "wifi": "无线网",
+    "vpn": "VPN",
+    "virtual": "虚拟网卡",
+    "other": "其他",
+}
 
 
 def is_frozen():
@@ -41,21 +50,34 @@ def pythonw_path():
     return exe
 
 
-def launch_target():
+def config_dir():
+    path = os.path.join(os.environ.get("APPDATA", "."), "SplitNIC")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def ipc_path():
+    return os.path.join(config_dir(), "ipc.json")
+
+
+def launch_target(extra_args=""):
     """Return (target, arguments, workdir, icon) for a shortcut."""
     workdir = app_dir()
     icon = os.path.join(workdir, "assets", "icon.ico")
     if not os.path.isfile(icon):
         icon = ""
+    extra = (extra_args or "").strip()
     if is_frozen():
-        return sys.executable, "", workdir, icon
+        return sys.executable, extra, workdir, icon
     script = os.path.join(workdir, "app.py")
-    return pythonw_path(), '"%s"' % script, workdir, icon
+    args = '"%s"' % script
+    if extra:
+        args = args + " " + extra
+    return pythonw_path(), args, workdir, icon
 
 
 def sh_folder(csidl):
     buf = ctypes.create_unicode_buffer(260)
-    # SHGetFolderPathW(hwnd, csidl, token, flags, pszPath)
     hr = shell32.SHGetFolderPathW(None, int(csidl), None, 0, buf)
     if hr != 0:
         return ""
@@ -84,9 +106,14 @@ def desktop_dirs():
     return found
 
 
+def primary_desktop():
+    dirs = desktop_dirs()
+    return dirs[0] if dirs else os.path.expanduser("~")
+
+
 def _write_lnk(lnk_path, target, args, workdir, icon, description):
     import subprocess
-    # Escape for PowerShell single-quoted strings: ' -> ''
+
     def q(s):
         return (s or "").replace("'", "''")
 
@@ -121,12 +148,16 @@ def set_lnk_run_as_admin(lnk_path):
         f.write(data)
 
 
-def create_shortcut(lnk_path, run_as_admin=True):
-    target, args, workdir, icon = launch_target()
+def create_shortcut(lnk_path, extra_args="", run_as_admin=True, icon=None, description=None):
+    target, args, workdir, default_icon = launch_target(extra_args)
     folder = os.path.dirname(lnk_path)
     if folder and not os.path.isdir(folder):
         os.makedirs(folder, exist_ok=True)
-    _write_lnk(lnk_path, target, args, workdir, icon, "网口分流 SplitNIC — 按软件选择网卡")
+    _write_lnk(
+        lnk_path, target, args, workdir,
+        icon if icon is not None else default_icon,
+        description or "网口分流 SplitNIC — 按软件选择网卡",
+    )
     if run_as_admin:
         try:
             set_lnk_run_as_admin(lnk_path)
@@ -144,6 +175,40 @@ def create_desktop_shortcuts(run_as_admin=True):
     return created
 
 
+def _safe_filename(name):
+    bad = '\\/:*?"<>|\r\n\t'
+    out = "".join("_" if ch in bad else ch for ch in (name or "分流"))
+    out = out.strip(" .") or "分流"
+    return out[:80]
+
+
+def rule_shortcut_basename(rule):
+    name = rule.get("name") or os.path.splitext(os.path.basename(rule.get("exe") or "app"))[0]
+    kind = KIND_SHORT.get(rule.get("adapter_kind") or "", "")
+    nic = kind or rule.get("adapter_name") or "分流"
+    return _safe_filename("%s（%s）" % (name, nic)) + ".lnk"
+
+
+def create_rule_shortcut(rule, desktop=None):
+    desk = desktop or primary_desktop()
+    path = os.path.join(desk, rule_shortcut_basename(rule))
+    extra = "--launch %s" % (rule.get("id") or "")
+    exe = rule.get("exe") or ""
+    icon = (exe + ",0") if exe and os.path.isfile(exe) else None
+    desc = "用指定网卡启动 %s（网口分流）" % (rule.get("name") or "")
+    return create_shortcut(path, extra_args=extra, run_as_admin=True, icon=icon, description=desc)
+
+
+def create_all_rule_shortcuts(rules):
+    desk = primary_desktop()
+    created = []
+    for rule in rules or []:
+        if not rule.get("id") or not rule.get("exe"):
+            continue
+        created.append(create_rule_shortcut(rule, desktop=desk))
+    return created
+
+
 def startup_lnk_path():
     folder = sh_folder(CSIDL_STARTUP)
     if not folder:
@@ -157,7 +222,12 @@ def startup_lnk_path():
 def set_start_with_windows(enabled):
     path = startup_lnk_path()
     if enabled:
-        create_shortcut(path, run_as_admin=True)
+        create_shortcut(
+            path,
+            extra_args="--launch-all --minimized",
+            run_as_admin=True,
+            description="开机启动网口分流并按规则拉起软件",
+        )
         return path
     if os.path.isfile(path):
         os.remove(path)
@@ -166,6 +236,48 @@ def set_start_with_windows(enabled):
 
 def is_start_with_windows():
     return os.path.isfile(startup_lnk_path())
+
+
+def post_ipc(command):
+    """Queue a command for the already-running instance."""
+    path = ipc_path()
+    items = []
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                items = [data]
+        except Exception:
+            items = []
+    items.append(command)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def drain_ipc():
+    path = ipc_path()
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        os.remove(path)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return [data]
+        return []
+    except Exception:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        return []
 
 
 def bring_existing_to_front():
@@ -178,12 +290,11 @@ def bring_existing_to_front():
 
 
 def ensure_single_instance():
-    """Return True if this is the first instance. Otherwise focus the other and return False."""
+    """Return True if this is the first instance."""
     global _mutex_handle
     kernel32.CreateMutexW.restype = wt.HANDLE
     kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wt.BOOL, wt.LPCWSTR]
     _mutex_handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
     if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
-        bring_existing_to_front()
         return False
     return True

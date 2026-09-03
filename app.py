@@ -37,7 +37,8 @@ from launcher import launch_app, list_running_processes, dll_path, guess_mode, i
 from diagnose import run_selftest
 from winutil import (
     ensure_single_instance, create_desktop_shortcuts, set_start_with_windows,
-    is_start_with_windows,
+    is_start_with_windows, create_rule_shortcut, create_all_rule_shortcuts,
+    post_ipc, drain_ipc, bring_existing_to_front,
 )
 
 APP_NAME = "网口分流"
@@ -73,8 +74,8 @@ HELP_TEXT = """\
 1. 先用管理员身份打开本程序（绑定网卡需要管理员权限）。
 2. 确认顶部「可用网卡」里至少有 2 张已连接、有 IPv4 的网卡。
 3. 点「添加软件」，选 exe，再选要走的网卡。
-4. 一定要从本程序点「启动」。从桌面图标或开始菜单直接打开，不会走你指定的网卡。
-5. 浏览器、抖音这类程序建议模式选「自动」或「浏览器代理」；WorkBuddy、VPN 客户端选「网卡绑定」。
+4. 点规则上的「快捷方式」，桌面会生成「软件名（有线网/无线网）」图标。以后请双击这个图标，不要用软件原来的桌面图标。
+5. 也可以在本程序里点「启动」。浏览器、抖音建议「自动/浏览器代理」；WorkBuddy、VPN 选「网卡绑定」。
 
 【启动模式】
   · 自动：浏览器走本地代理，其它程序尝试网卡绑定（注入 BindHook.dll）。
@@ -85,6 +86,8 @@ HELP_TEXT = """\
 【必须知道的限制】
   · 微软商店 UWP 应用无法分流。
   · 带反作弊的游戏往往会拒绝 DLL 注入，请不要对这类程序使用「网卡绑定」。
+  · 启动后规则上会显示「出口 x.x.x.x」，那是这张网卡测到的公网 IP，用来确认有没有走对。
+  · 开机启动会带上「按规则自动拉起软件」。网卡重新插上后，也会自动启动勾了「自动启动」且当时没在运行的软件。
   · Chrome / Edge / 抖音 是单实例程序：启动前请勾选「先关闭已运行的同名进程」，否则新进程只会附到旧进程上，代理参数无效。
   · Firefox 代理模式会使用独立配置目录，和你日常的书签/登录不是同一套。
   · 32 位程序无法使用当前的 64 位绑定模块，请改用代理模式或 64 位版本。
@@ -142,6 +145,7 @@ def _apply_setting_defaults(settings):
     settings.setdefault("minimize_to_tray", True)
     settings.setdefault("start_with_windows", False)
     settings.setdefault("auto_refresh", True)
+    settings.setdefault("auto_launch_on_nic", True)
     return settings
 
 
@@ -166,6 +170,7 @@ def new_rule(**kwargs):
         "mode": "auto",
         "close_existing": True,
         "enabled": True,
+        "auto_launch": True,
     }
     rule.update(kwargs)
     return rule
@@ -237,7 +242,7 @@ class RuleEditor(ctk.CTkToplevel):
         self.rule = dict(rule)
         self.on_save = on_save
         self.title("编辑分流规则" if rule.get("exe") else "添加软件")
-        self.geometry("620x560")
+        self.geometry("620x620")
         self.transient(master)
         self.grab_set()
 
@@ -290,7 +295,10 @@ class RuleEditor(ctk.CTkToplevel):
 
         self.var_close = ctk.BooleanVar(value=bool(rule.get("close_existing", True)))
         ctk.CTkCheckBox(self, text="启动前先关闭已运行的同名进程（浏览器 / 抖音必须勾选）",
-                        variable=self.var_close).pack(anchor="w", padx=18, pady=14)
+                        variable=self.var_close).pack(anchor="w", padx=18, pady=(14, 4))
+        self.var_auto = ctk.BooleanVar(value=bool(rule.get("auto_launch", True)))
+        ctk.CTkCheckBox(self, text="开机 / 这张网卡重新连上时，若软件没在运行则自动启动",
+                        variable=self.var_auto).pack(anchor="w", padx=18, pady=(4, 10))
 
         self.e_name.insert(0, rule.get("name") or "")
         self.e_exe.insert(0, rule.get("exe") or "")
@@ -337,17 +345,18 @@ class RuleEditor(ctk.CTkToplevel):
             "adapter_kind": adapter["kind"],
             "mode": mode,
             "close_existing": bool(self.var_close.get()),
+            "auto_launch": bool(self.var_auto.get()),
         })
         self.on_save(self.rule)
         self.destroy()
 
 
 class SplitNICApp(ctk.CTk):
-    def __init__(self):
+    def __init__(self, pending_cmds=None, start_minimized=False):
         super().__init__()
         self.title("%s  %s" % (APP_NAME, APP_NAME_EN))
-        self.geometry("1180x780")
-        self.minsize(980, 640)
+        self.geometry("1240x800")
+        self.minsize(1040, 660)
         self.configure(fg_color=("#f4f6fb", "#0f1419"))
         icon_path = os.path.join(HERE, "assets", "icon.ico")
         if os.path.isfile(icon_path):
@@ -362,7 +371,14 @@ class SplitNICApp(ctk.CTk):
         self._busy = False
         self._tray = None
         self._nic_sig = None
+        self._up_guids = set()
         self._quitting = False
+        self._egress = {}
+        self._adapter_pub = {}
+        self._pending_cmds = list(pending_cmds or [])
+        self._start_minimized = bool(start_minimized)
+        self._boot_done = False
+        self._queue = []
 
         self.font_title = ctk.CTkFont(family="Microsoft YaHei UI", size=22, weight="bold")
         self.font_h = ctk.CTkFont(family="Microsoft YaHei UI", size=15, weight="bold")
@@ -374,8 +390,12 @@ class SplitNICApp(ctk.CTk):
         self.render_rules()
         self.after(200, self._warn_if_needed)
         self.after(400, self._start_tray)
-        self.after(800, self._schedule_auto_refresh)
+        self.after(700, self._poll_ipc)
+        self.after(900, self._run_pending)
+        self.after(1200, self._schedule_auto_refresh)
         self.bind("<F5>", lambda e: self.refresh_adapters())
+        if self._start_minimized:
+            self.after(150, self.withdraw)
 
     def _build(self):
         header = ctk.CTkFrame(self, fg_color="transparent")
@@ -440,13 +460,15 @@ class SplitNICApp(ctk.CTk):
                       command=self.refresh_adapters).pack(side="right", padx=6)
         ctk.CTkButton(tools, text="运行诊断", width=90, fg_color="#0f766e",
                       command=self.run_diagnose).pack(side="right", padx=6)
+        ctk.CTkButton(tools, text="规则快捷方式", width=110, fg_color="#7c3aed",
+                      command=self.make_all_rule_shortcuts).pack(side="right", padx=6)
 
         self.rule_box = ctk.CTkScrollableFrame(tab, height=280)
         self.rule_box.pack(fill="both", expand=True, pady=(4, 8))
 
         hint = (
-            "示例：把 WorkBuddy、VPN 指到「有线网」，把抖音、浏览器指到「无线网」。"
-            "必须从这里点启动，不要从桌面图标打开。"
+            "示例：WorkBuddy / VPN → 有线网，抖音 / 浏览器 → 无线网。"
+            "点「快捷方式」生成桌面图标，以后请用那个图标打开，不要用软件原来的图标。"
         )
         ctk.CTkLabel(tab, text=hint, font=self.font_small, text_color="gray",
                      wraplength=1000, justify="left").pack(anchor="w", pady=(0, 4))
@@ -491,15 +513,20 @@ class SplitNICApp(ctk.CTk):
                         variable=self.var_tray, command=self._save_settings).pack(anchor="w", pady=6)
         ctk.CTkCheckBox(wrap, text="自动刷新网卡（约 20 秒，网卡插拔后不用手点刷新）",
                         variable=self.var_auto, command=self._save_settings).pack(anchor="w", pady=6)
-        ctk.CTkCheckBox(wrap, text="开机自动启动（管理员，写入当前用户启动文件夹）",
+        ctk.CTkCheckBox(wrap, text="开机自动启动（管理员；启动后按规则自动拉起勾了「自动启动」的软件）",
                         variable=self.var_boot, command=self._toggle_autostart).pack(anchor="w", pady=6)
+        self.var_nic_launch = ctk.BooleanVar(value=bool(s.get("auto_launch_on_nic", True)))
+        ctk.CTkCheckBox(wrap, text="网卡重新连上后，自动启动绑在这张卡上、且当时没在运行的软件",
+                        variable=self.var_nic_launch, command=self._save_settings).pack(anchor="w", pady=6)
 
         ctk.CTkLabel(wrap, text="快捷方式", font=self.font_h).pack(anchor="w", pady=(18, 6))
-        ctk.CTkButton(wrap, text="在桌面创建快捷方式（管理员启动、无黑框）", width=320,
+        ctk.CTkButton(wrap, text="在桌面创建「网口分流」快捷方式", width=320,
                       command=self.make_desktop_shortcut).pack(anchor="w", pady=4)
-        ctk.CTkLabel(wrap, text="快捷方式默认以管理员运行、用 pythonw 无控制台窗口。",
+        ctk.CTkButton(wrap, text="为每条规则创建桌面快捷方式（软件名＋网卡）", width=320,
+                      fg_color="#7c3aed", command=self.make_all_rule_shortcuts).pack(anchor="w", pady=4)
+        ctk.CTkLabel(wrap, text="规则快捷方式例如：WorkBuddy（有线网）、抖音（无线网）。双击即按规则启动。",
                      font=self.font_small, text_color="gray").pack(anchor="w")
-        ctk.CTkLabel(wrap, text="F5 刷新网卡。再开一次程序会激活已有窗口，不会重复开。",
+        ctk.CTkLabel(wrap, text="F5 刷新网卡。再开一次程序会把命令交给已有窗口，不会重复开。",
                      font=self.font_small, text_color="gray").pack(anchor="w", pady=(8, 0))
 
     def _save_settings(self):
@@ -507,6 +534,7 @@ class SplitNICApp(ctk.CTk):
         s["minimize_to_tray"] = bool(self.var_tray.get())
         s["auto_refresh"] = bool(self.var_auto.get())
         s["start_with_windows"] = bool(self.var_boot.get())
+        s["auto_launch_on_nic"] = bool(self.var_nic_launch.get())
         save_config(self.config_data)
 
     def _toggle_autostart(self):
@@ -527,6 +555,32 @@ class SplitNICApp(ctk.CTk):
             created = create_desktop_shortcuts(run_as_admin=True)
             self.log("已创建桌面快捷方式：%s" % " ； ".join(created))
             messagebox.showinfo(APP_NAME, "已在桌面创建「网口分流」快捷方式。\n双击会请求管理员权限。")
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, "创建快捷方式失败：%s" % exc)
+
+    def make_all_rule_shortcuts(self):
+        rules = self.config_data.get("rules") or []
+        if not rules:
+            messagebox.showinfo(APP_NAME, "还没有规则。请先添加软件。")
+            return
+        try:
+            created = create_all_rule_shortcuts(rules)
+            self.log("已创建 %d 个规则快捷方式" % len(created))
+            for p in created:
+                self.log("  " + p)
+            messagebox.showinfo(
+                APP_NAME,
+                "已在桌面创建 %d 个快捷方式，例如「WorkBuddy（有线网）」。\n"
+                "以后请用这些图标打开对应软件。" % len(created),
+            )
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, "创建规则快捷方式失败：%s" % exc)
+
+    def make_one_rule_shortcut(self, rule):
+        try:
+            path = create_rule_shortcut(rule)
+            self.log("已创建快捷方式：%s" % path)
+            messagebox.showinfo(APP_NAME, "已放到桌面：\n%s" % os.path.basename(path))
         except Exception as exc:
             messagebox.showerror(APP_NAME, "创建快捷方式失败：%s" % exc)
 
@@ -566,6 +620,17 @@ class SplitNICApp(ctk.CTk):
             self._render_nic_details(all_nics)
             if changed and silent:
                 self.render_rules()
+        new_up = set(
+            a.get("guid") for a in self.adapters
+            if a.get("up") and a.get("ipv4") and a.get("guid")
+        )
+        appeared = new_up - self._up_guids
+        if self._boot_done and appeared and self._settings().get("auto_launch_on_nic", True):
+            for guid in appeared:
+                self._auto_launch_for_guid(guid)
+        self._up_guids = new_up
+        if not self._boot_done:
+            self._boot_done = True
         if silent and not changed:
             return
         up = [a for a in self.adapters if a.get("up") and a.get("ipv4")]
@@ -595,7 +660,10 @@ class SplitNICApp(ctk.CTk):
             gw = (a.get("gateway") or ["-"])[0]
             line = "%s    %s    网关 %s" % (a["kind_label"], ip, gw)
             ctk.CTkLabel(body, text=line, font=self.font_small, text_color="gray", anchor="w").pack(anchor="w")
+            pub = self._adapter_pub.get(a.get("guid"))
             status = a["oper_label"] if a.get("ipv4") else a["oper_label"] + "（缺 IPv4）"
+            if pub:
+                status = status + "    公网 " + pub
             ctk.CTkLabel(body, text=status, font=self.font_small, text_color=color, anchor="w").pack(anchor="w")
 
     def _render_nic_details(self, all_nics):
@@ -628,7 +696,7 @@ class SplitNICApp(ctk.CTk):
             return
         header = ctk.CTkFrame(self.rule_box, fg_color="transparent")
         header.pack(fill="x", pady=(0, 4))
-        for text, width in (("软件", 180), ("网卡", 200), ("模式", 90), ("状态", 70), ("路径", 300)):
+        for text, width in (("软件", 160), ("网卡", 170), ("模式", 80), ("状态", 60), ("出口 IP", 130)):
             ctk.CTkLabel(header, text=text, width=width, anchor="w",
                          font=self.font_small, text_color="gray").pack(side="left")
 
@@ -652,24 +720,33 @@ class SplitNICApp(ctk.CTk):
             nic_color = "#f59e0b"
 
         ctk.CTkLabel(row, text=rule.get("name") or os.path.basename(rule.get("exe") or ""),
-                     width=180, anchor="w", font=self.font_h).pack(side="left", padx=(10, 0), pady=10)
-        ctk.CTkLabel(row, text=nic_text, width=220, anchor="w", font=self.font,
+                     width=160, anchor="w", font=self.font_h).pack(side="left", padx=(10, 0), pady=10)
+        ctk.CTkLabel(row, text=nic_text, width=170, anchor="w", font=self.font,
                      text_color=nic_color).pack(side="left")
         ctk.CTkLabel(row, text=MODE_LABELS.get(rule.get("mode") or "auto", "自动"),
-                     width=90, anchor="w", font=self.font).pack(side="left")
+                     width=80, anchor="w", font=self.font).pack(side="left")
         running = is_exe_running(rule.get("exe") or "")
-        ctk.CTkLabel(row, text="运行中" if running else "未运行", width=70, anchor="w",
+        ctk.CTkLabel(row, text="运行中" if running else "未运行", width=60, anchor="w",
                      font=self.font_small, text_color="#22c55e" if running else "gray").pack(side="left")
-        ctk.CTkLabel(row, text=rule.get("exe") or "", width=300, anchor="w",
-                     font=self.font_small, text_color="gray").pack(side="left")
+        info = self._egress.get(rule.get("id") or "")
+        if info and info.get("ip"):
+            egress_text, egress_color = info["ip"], "#38bdf8"
+        elif info and info.get("error"):
+            egress_text, egress_color = "未测到", "#f59e0b"
+        else:
+            egress_text, egress_color = "—", "gray"
+        ctk.CTkLabel(row, text=egress_text, width=130, anchor="w",
+                     font=self.font_small, text_color=egress_color).pack(side="left")
 
         btns = ctk.CTkFrame(row, fg_color="transparent")
         btns.pack(side="right", padx=8)
-        ctk.CTkButton(btns, text="启动", width=70, command=lambda r=rule: self.start_rule(r)).pack(side="left", padx=3)
-        ctk.CTkButton(btns, text="编辑", width=60, fg_color="gray",
-                      command=lambda r=rule: self.edit_rule(r)).pack(side="left", padx=3)
-        ctk.CTkButton(btns, text="删除", width=60, fg_color="#b91c1c", hover_color="#7f1d1d",
-                      command=lambda r=rule: self.delete_rule(r)).pack(side="left", padx=3)
+        ctk.CTkButton(btns, text="启动", width=64, command=lambda r=rule: self.start_rule(r)).pack(side="left", padx=2)
+        ctk.CTkButton(btns, text="快捷方式", width=78, fg_color="#7c3aed", hover_color="#5b21b6",
+                      command=lambda r=rule: self.make_one_rule_shortcut(r)).pack(side="left", padx=2)
+        ctk.CTkButton(btns, text="编辑", width=52, fg_color="gray",
+                      command=lambda r=rule: self.edit_rule(r)).pack(side="left", padx=2)
+        ctk.CTkButton(btns, text="删除", width=52, fg_color="#b91c1c", hover_color="#7f1d1d",
+                      command=lambda r=rule: self.delete_rule(r)).pack(side="left", padx=2)
 
     def persist(self):
         save_config(self.config_data)
@@ -738,15 +815,65 @@ class SplitNICApp(ctk.CTk):
         self.log("正在启动 %s …" % rule.get("name"))
         pid, method = launch_app(rule, adapter, self.proxy_pool, log=self.log)
         self.log("已启动 %s  PID %s  %s" % (rule.get("name"), pid, method))
+        self._probe_egress(rule, adapter)
         return pid
 
-    def start_rule(self, rule):
-        if self._busy:
-            self.log("请等待当前启动完成。")
+    def _probe_egress(self, rule, adapter):
+        rid = rule.get("id") or ""
+        bind_ip = (adapter.get("ipv4") or [None])[0]
+        if_index = adapter.get("if_index")
+        name = rule.get("name") or rid
+
+        def work():
+            try:
+                pub = public_ip_via(bind_ip, if_index)
+                self._egress[rid] = {"ip": pub, "adapter": adapter.get("name")}
+                if adapter.get("guid"):
+                    self._adapter_pub[adapter["guid"]] = pub
+                self.log("  %s 实际出口 %s（经 %s %s）" % (
+                    name, pub, adapter.get("kind_label"), adapter.get("name")))
+            except Exception as exc:
+                self._egress[rid] = {"ip": None, "error": str(exc)}
+                self.log("  %s 出口探测失败：%s" % (name, exc))
+            self.after(0, self.render_rules)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def start_rule(self, rule, quiet=False):
+        self._queue.append((rule, quiet))
+        self._kick_queue()
+
+    def start_all(self, only_auto=False, skip_running=False, quiet=False):
+        rules = []
+        for r in self.config_data.get("rules") or []:
+            if not r.get("enabled", True):
+                continue
+            if only_auto and not r.get("auto_launch", True):
+                continue
+            if skip_running and is_exe_running(r.get("exe") or ""):
+                self.log("跳过已在运行：%s" % r.get("name"))
+                continue
+            rules.append(r)
+        if not rules:
+            if not quiet:
+                messagebox.showinfo(APP_NAME, "没有可启动的规则。")
             return
+        if not is_admin():
+            self.log("未提权批量启动：网卡绑定类规则可能失败。")
+        for r in rules:
+            self.start_rule(r, quiet=quiet)
+
+    def _kick_queue(self):
+        if self._busy or not self._queue:
+            return
+        rule, quiet = self._queue.pop(0)
         adapter = self._resolve_adapter(rule)
         if not adapter or not adapter.get("up") or not adapter.get("ipv4"):
-            messagebox.showerror(APP_NAME, "规则「%s」指定的网卡当前不可用。请连接该网卡后刷新。" % rule.get("name"))
+            msg = "规则「%s」指定的网卡当前不可用。" % rule.get("name")
+            self.log(msg)
+            if not quiet:
+                messagebox.showerror(APP_NAME, msg + "请连接该网卡后刷新。")
+            self.after(50, self._kick_queue)
             return
         mode = rule.get("mode") or "auto"
         resolved = mode if mode != "auto" else guess_mode(rule.get("exe") or "")
@@ -760,54 +887,91 @@ class SplitNICApp(ctk.CTk):
             except Exception as exc:
                 self.log("启动失败：%s" % exc)
                 err = str(exc)
-                self.after(0, lambda: messagebox.showerror(APP_NAME, "启动失败：\n%s" % err))
+                if not quiet:
+                    self.after(0, lambda: messagebox.showerror(APP_NAME, "启动失败：\n%s" % err))
             finally:
                 self._busy = False
+                self.after(80, self._kick_queue)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def start_all(self):
-        rules = [r for r in self.config_data.get("rules") or [] if r.get("enabled", True)]
-        if not rules:
-            messagebox.showinfo(APP_NAME, "没有可启动的规则。")
-            return
-        if self._busy:
-            self.log("请等待当前启动完成。")
-            return
-        if not is_admin():
-            self.log("未提权批量启动：网卡绑定类规则可能失败。")
+    def _find_rule(self, rule_id):
+        for r in self.config_data.get("rules") or []:
+            if r.get("id") == rule_id:
+                return r
+        return None
 
-        def work():
-            self._busy = True
-            try:
-                import time
-                for r in rules:
-                    try:
-                        self._launch_one(r)
-                    except Exception as exc:
-                        self.log("启动 %s 失败：%s" % (r.get("name"), exc))
-                    time.sleep(0.6)
-            finally:
-                self._busy = False
+    def _auto_launch_for_guid(self, guid):
+        nic = None
+        for a in self.adapters:
+            if a.get("guid") == guid:
+                nic = a
+                break
+        self.log("网卡恢复：%s，检查自动启动规则…" % ((nic or {}).get("name") or guid))
+        for rule in self.config_data.get("rules") or []:
+            if not rule.get("enabled", True) or not rule.get("auto_launch", True):
+                continue
+            adapter = self._resolve_adapter(rule)
+            if not adapter or adapter.get("guid") != guid:
+                continue
+            if is_exe_running(rule.get("exe") or ""):
+                self.log("  %s 已在运行，跳过" % rule.get("name"))
+                continue
+            self.log("  自动启动 %s" % rule.get("name"))
+            self.start_rule(rule, quiet=True)
 
-        threading.Thread(target=work, daemon=True).start()
+    def _run_pending(self):
+        cmds = list(self._pending_cmds)
+        self._pending_cmds = []
+        self._apply_cmds(cmds)
+
+    def _apply_cmds(self, cmds):
+        for cmd in cmds:
+            action = (cmd or {}).get("action")
+            if action == "launch-all":
+                self.log("收到命令：按规则自动启动")
+                self.start_all(only_auto=True, skip_running=True, quiet=True)
+            elif action == "launch":
+                rid = cmd.get("id")
+                rule = self._find_rule(rid)
+                if not rule:
+                    self.log("找不到规则 id=%s" % rid)
+                    continue
+                self.log("收到命令：启动 %s" % rule.get("name"))
+                if not self._start_minimized:
+                    self.show_from_tray()
+                self.start_rule(rule, quiet=True)
+
+    def _poll_ipc(self):
+        if self._quitting:
+            return
+        try:
+            cmds = drain_ipc()
+            if cmds:
+                self._apply_cmds(cmds)
+        except Exception:
+            pass
+        if not self._quitting:
+            self.after(700, self._poll_ipc)
 
     def test_public_ips(self):
         nics = [a for a in self.adapters if a.get("up") and a.get("ipv4")]
         if not nics:
             messagebox.showinfo(APP_NAME, "没有已连接且有 IPv4 的网卡。")
             return
-        self.log("开始测试每张网卡的公网 IP（访问 api.ipify.org）…")
+        self.log("开始测试每张网卡的公网 IP…")
 
         def work():
             for a in nics:
                 ip = a["ipv4"][0]
                 try:
                     pub = public_ip_via(ip, a["if_index"])
+                    self._adapter_pub[a.get("guid")] = pub
                     self.log("  %s (%s, %s)  公网 IP = %s" % (a["name"], a["kind_label"], ip, pub))
                 except Exception as exc:
                     self.log("  %s (%s, %s)  测试失败：%s" % (a["name"], a["kind_label"], ip, exc))
             self.log("公网 IP 测试结束。两张网卡如果公网 IP 不同，说明分流有物理基础。")
+            self.after(0, self._render_nic_cards)
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -819,6 +983,11 @@ class SplitNICApp(ctk.CTk):
             self.log("未找到 BindHook.dll：网卡绑定模式不可用，浏览器代理模式仍可使用。运行 build.ps1 可编译该模块。")
         else:
             self.log("绑定模块：%s" % hook)
+        if is_start_with_windows():
+            try:
+                set_start_with_windows(True)
+            except Exception:
+                pass
 
     def run_diagnose(self):
         self.tabs.set("诊断")
@@ -910,12 +1079,46 @@ class SplitNICApp(ctk.CTk):
             pass
 
 
+def parse_cli(argv):
+    launch_ids = []
+    launch_all = False
+    minimized = False
+    args = list(argv)
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--launch" and i + 1 < len(args):
+            launch_ids.append(args[i + 1])
+            i += 2
+            continue
+        if a == "--launch-all":
+            launch_all = True
+            i += 1
+            continue
+        if a == "--minimized":
+            minimized = True
+            i += 1
+            continue
+        i += 1
+    cmds = []
+    if launch_all:
+        cmds.append({"action": "launch-all"})
+    for rid in launch_ids:
+        cmds.append({"action": "launch", "id": rid})
+    return cmds, minimized
+
+
 def main():
+    cmds, minimized = parse_cli(sys.argv[1:])
     if not ensure_single_instance():
+        for cmd in cmds:
+            post_ipc(cmd)
+        if not minimized:
+            bring_existing_to_front()
         return
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
-    app = SplitNICApp()
+    app = SplitNICApp(pending_cmds=cmds, start_minimized=minimized)
     app.protocol("WM_DELETE_WINDOW", app.on_close)
     app.mainloop()
 
