@@ -110,28 +110,64 @@ def files_from_drop(paths):
     return out
 
 
+def _return_copy(event=None):
+    return "copy"
+
+
 def bind_drop(widget, handler):
-    """Register Windows file drop on a Tk/CTk widget if tkdnd is loaded."""
+    """Register OLE file drop. DropEnter/DropPosition MUST return 'copy'
+    or Windows shows the red-white blocked cursor and never fires <<Drop>>."""
     try:
-        from tkinterdnd2 import DND_FILES
+        from tkinterdnd2 import DND_FILES, DND_ALL, CF_HDROP
     except Exception:
         return False
-    ok = False
+
+    def on_drop(event):
+        try:
+            handler(event)
+        except Exception:
+            pass
+        return "copy"
+
+    types = (DND_FILES, CF_HDROP, DND_ALL)
     candidates = [widget]
     for attr in ("_canvas", "canvas", "_textbox"):
         inner = getattr(widget, attr, None)
         if inner is not None:
             candidates.append(inner)
+    ok = False
     for w in candidates:
         try:
-            w.drop_target_register(DND_FILES)
-            w.dnd_bind("<<Drop>>", handler)
+            w.drop_target_register(*types)
+        except Exception:
+            try:
+                w.tk.call("tkdnd::drop_target", "register", w._w, types)
+            except Exception:
+                continue
+        try:
+            w.dnd_bind("<<DropEnter>>", _return_copy)
+            w.dnd_bind("<<DropPosition>>", _return_copy)
+            w.dnd_bind("<<Drop>>", on_drop)
             ok = True
         except Exception:
             try:
-                w.tk.call("tkdnd::drop_target", "register", w._w, DND_FILES)
-                w.bind("<<Drop>>", handler)
+                w.bind("<<DropEnter>>", lambda e: "copy")
+                w.bind("<<DropPosition>>", lambda e: "copy")
+                w.bind("<<Drop>>", on_drop)
                 ok = True
             except Exception:
                 continue
     return ok
+
+
+def bind_drop_tree(widget, handler, _depth=0):
+    """Register drop on widget and all children (CTk covers the window)."""
+    if _depth > 12 or widget is None:
+        return
+    bind_drop(widget, handler)
+    try:
+        children = widget.winfo_children()
+    except Exception:
+        children = []
+    for ch in children:
+        bind_drop_tree(ch, handler, _depth + 1)

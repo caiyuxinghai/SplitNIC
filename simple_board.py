@@ -207,7 +207,8 @@ class SimpleBoard(ctk.CTkFrame):
         return zone
 
     def bind_os_drops(self):
-        from dropfiles import bind_drop
+        from dropfiles import bind_drop, bind_drop_tree
+        bind_drop(self.ctrl.root, lambda e: self.ctrl._on_tk_drop(e))
         bind_drop(self, lambda e: self.ctrl._on_tk_drop(e))
         bind_drop(self.body, lambda e: self.ctrl._on_tk_drop(e))
         for zone in self._zones.values():
@@ -216,14 +217,25 @@ class SimpleBoard(ctk.CTkFrame):
             well = getattr(zone, "_well", None)
             if well is not None:
                 self._bind_adapter_drop(well, adapter)
+            bind_drop_tree(zone, lambda e, ad=adapter: self._zone_drop_event(e, ad))
+
+    def _zone_drop_event(self, event, adapter):
+        from dropfiles import files_from_drop
+        data = getattr(event, "data", "") or ""
+        try:
+            parts = list(self.tk.splitlist(data))
+        except Exception:
+            parts = [data]
+        exes = files_from_drop(parts)
+        if not exes:
+            self.set_status("没认出程序。请拖桌面上的快捷方式")
+            return "copy"
+        for exe in exes:
+            self.ctrl.add_exe_to_adapter(adapter, exe_path=exe)
+        return "copy"
 
     def _bind_adapter_drop(self, widget, adapter):
-        from dropfiles import files_from_drop
-        try:
-            from tkinterdnd2 import DND_FILES
-            widget.drop_target_register(DND_FILES)
-        except Exception:
-            return
+        from dropfiles import bind_drop, files_from_drop
 
         def handler(event, ad=adapter):
             data = getattr(event, "data", "") or ""
@@ -234,14 +246,12 @@ class SimpleBoard(ctk.CTkFrame):
             exes = files_from_drop(parts)
             if not exes:
                 self.set_status("没认出程序。请拖桌面上的快捷方式（会自动找到对应软件）")
-                return
+                return "copy"
             for exe in exes:
                 self.ctrl.add_exe_to_adapter(ad, exe_path=exe)
+            return "copy"
 
-        try:
-            widget.dnd_bind("<<Drop>>", handler)
-        except Exception:
-            widget.bind("<<Drop>>", handler)
+        bind_drop(widget, handler)
 
     def _rules_for(self, adapter):
         from adapters import find_adapter

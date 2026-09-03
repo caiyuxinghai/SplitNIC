@@ -524,6 +524,7 @@ class SplitNICApp(ctk.CTkFrame):
             y = int(self.root.winfo_pointery())
         self.log("拖入：%s → %s" % (data, "；".join(os.path.basename(e) for e in exes) or "未能识别"))
         self._on_desktop_drop(exes, int(x), int(y), parts)
+        return "copy"
 
     def _on_desktop_drop(self, exes, x, y, raw=None):
         if getattr(self, "_advanced", False):
@@ -1397,12 +1398,10 @@ def main():
             pass
     app = SplitNICApp(root, pending_cmds=cmds, start_minimized=minimized)
     app.pack(fill="both", expand=True)
-    if HAS_DND and DND_FILES is not None:
-        try:
-            root.drop_target_register(DND_FILES)
-            root.dnd_bind("<<Drop>>", app._on_tk_drop)
-        except Exception:
-            pass
+    if HAS_DND:
+        from dropfiles import bind_drop
+        bind_drop(root, app._on_tk_drop)
+        bind_drop(app, app._on_tk_drop)
     root.protocol("WM_DELETE_WINDOW", app.on_close)
     if minimized:
         root.withdraw()
