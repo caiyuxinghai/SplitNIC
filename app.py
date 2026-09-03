@@ -35,15 +35,8 @@ from tkinter import filedialog, messagebox
 HAS_DND = False
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
-
-    class CTkRoot(ctk.CTk, TkinterDnD.DnDWrapper):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.TkdndVersion = TkinterDnD._require(self)
-
     HAS_DND = True
 except Exception:
-    CTkRoot = ctk.CTk
     TkinterDnD = None
     DND_FILES = None
 
@@ -387,21 +380,12 @@ class RuleEditor(ctk.CTkToplevel):
         self.destroy()
 
 
-class SplitNICApp(CTkRoot):
-    def __init__(self, pending_cmds=None, start_minimized=False):
-        super().__init__()
-        self.title("%s  %s" % (APP_NAME, APP_NAME_EN))
-        self.geometry("1280x760")
-        self.minsize(980, 620)
-        self.configure(fg_color="#0b0e14")
+class SplitNICApp(ctk.CTkFrame):
+    def __init__(self, master, pending_cmds=None, start_minimized=False):
+        super().__init__(master, fg_color="#0b0e14")
+        self.root = master
         self._has_dnd = HAS_DND
         self._advanced = False
-        icon_path = os.path.join(HERE, "assets", "icon.ico")
-        if os.path.isfile(icon_path):
-            try:
-                self.iconbitmap(icon_path)
-            except Exception:
-                pass
 
         self.config_data = load_config()
         self.adapters = []
@@ -439,15 +423,14 @@ class SplitNICApp(CTkRoot):
         self.bind("<F5>", lambda e: self.refresh_adapters())
         self.after(80, self._force_show)
         if self._start_minimized:
-            self.after(400, self.withdraw)
+            self.after(400, self.root.withdraw)
 
     def _force_show(self):
         try:
-            self.deiconify()
-            self.lift()
-            self.state("normal")
-            self.attributes("-topmost", True)
-            self.after(600, lambda: self.attributes("-topmost", False))
+            self.root.deiconify()
+            self.root.lift()
+            self.root.attributes("-topmost", True)
+            self.after(600, lambda: self.root.attributes("-topmost", False))
         except Exception:
             pass
 
@@ -510,25 +493,37 @@ class SplitNICApp(CTkRoot):
             messagebox.showerror(APP_NAME, "提权失败。请右键「启动网口分流.bat」选择以管理员身份运行。")
 
     def _install_native_drop(self):
-        from dropfiles import bind_drop
-        ok = bind_drop(self, self._on_tk_drop)
+        ok = False
+        if HAS_DND and DND_FILES:
+            try:
+                self.root.drop_target_register(DND_FILES)
+                self.root.dnd_bind("<<Drop>>", self._on_tk_drop)
+                ok = True
+            except Exception as exc:
+                self.log("根窗口拖入失败：%s" % exc)
         if hasattr(self, "simple_board"):
             self.simple_board.bind_os_drops()
+            ok = True
         if ok:
-            self.log("已开启桌面图标拖入")
+            self.log("可以把桌面快捷方式拖进有线网 / 无线网")
         else:
-            self.log("桌面拖入未就绪：请用卡片上的「选择程序」按钮，或把图标拖到虚线框里再试")
+            self.log("拖入未就绪：请点卡片上的「选择程序」")
 
     def _on_tk_drop(self, event):
         from dropfiles import files_from_drop
+        data = getattr(event, "data", "") or ""
         try:
-            parts = list(self.tk.splitlist(event.data))
+            parts = list(self.tk.splitlist(data))
         except Exception:
-            parts = [getattr(event, "data", "")]
+            parts = [data]
         exes = files_from_drop(parts)
-        x = int(self.winfo_pointerx())
-        y = int(self.winfo_pointery())
-        self._on_desktop_drop(exes, x, y, parts)
+        x = getattr(event, "x_root", None)
+        y = getattr(event, "y_root", None)
+        if x is None or y is None:
+            x = int(self.root.winfo_pointerx())
+            y = int(self.root.winfo_pointery())
+        self.log("拖入：%s → %s" % (data, "；".join(os.path.basename(e) for e in exes) or "未能识别"))
+        self._on_desktop_drop(exes, int(x), int(y), parts)
 
     def _on_desktop_drop(self, exes, x, y, raw=None):
         if getattr(self, "_advanced", False):
@@ -1316,15 +1311,15 @@ class SplitNICApp(CTkRoot):
 
     def show_from_tray(self):
         try:
-            self.deiconify()
-            self.lift()
-            self.focus_force()
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
         except Exception:
             pass
 
     def on_close(self):
         if not self._quitting and self._settings().get("minimize_to_tray", True) and self._tray:
-            self.withdraw()
+            self.root.withdraw()
             self.log("已最小化到托盘。要退出请右键托盘图标选「退出」。")
             return
         self.quit_app()
@@ -1341,7 +1336,7 @@ class SplitNICApp(CTkRoot):
         except Exception:
             pass
         try:
-            self.destroy()
+            self.root.destroy()
         except Exception:
             pass
 
@@ -1385,9 +1380,36 @@ def main():
         return
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("dark-blue")
-    app = SplitNICApp(pending_cmds=cmds, start_minimized=minimized)
-    app.protocol("WM_DELETE_WINDOW", app.on_close)
-    app.mainloop()
+    if HAS_DND:
+        root = TkinterDnD.Tk()
+    else:
+        import tkinter as tk
+        root = tk.Tk()
+    root.title("%s  %s" % (APP_NAME, APP_NAME_EN))
+    root.geometry("1280x760")
+    root.minsize(980, 620)
+    root.configure(bg="#0b0e14")
+    icon_path = os.path.join(HERE, "assets", "icon.ico")
+    if os.path.isfile(icon_path):
+        try:
+            root.iconbitmap(icon_path)
+        except Exception:
+            pass
+    app = SplitNICApp(root, pending_cmds=cmds, start_minimized=minimized)
+    app.pack(fill="both", expand=True)
+    if HAS_DND and DND_FILES is not None:
+        try:
+            root.drop_target_register(DND_FILES)
+            root.dnd_bind("<<Drop>>", app._on_tk_drop)
+        except Exception:
+            pass
+    root.protocol("WM_DELETE_WINDOW", app.on_close)
+    if minimized:
+        root.withdraw()
+    else:
+        root.deiconify()
+        root.lift()
+    root.mainloop()
 
 
 def write_error_log(text):

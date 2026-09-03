@@ -218,21 +218,30 @@ class SimpleBoard(ctk.CTkFrame):
                 self._bind_adapter_drop(well, adapter)
 
     def _bind_adapter_drop(self, widget, adapter):
-        from dropfiles import bind_drop, files_from_drop
+        from dropfiles import files_from_drop
+        try:
+            from tkinterdnd2 import DND_FILES
+            widget.drop_target_register(DND_FILES)
+        except Exception:
+            return
 
         def handler(event, ad=adapter):
+            data = getattr(event, "data", "") or ""
             try:
-                parts = list(widget.tk.splitlist(getattr(event, "data", "")))
+                parts = list(widget.tk.splitlist(data))
             except Exception:
-                parts = [getattr(event, "data", "")]
+                parts = [data]
             exes = files_from_drop(parts)
             if not exes:
-                self.set_status("请拖入程序或桌面快捷方式（.lnk / .exe）")
+                self.set_status("没认出程序。请拖桌面上的快捷方式（会自动找到对应软件）")
                 return
             for exe in exes:
                 self.ctrl.add_exe_to_adapter(ad, exe_path=exe)
 
-        bind_drop(widget, handler)
+        try:
+            widget.dnd_bind("<<Drop>>", handler)
+        except Exception:
+            widget.bind("<<Drop>>", handler)
 
     def _rules_for(self, adapter):
         from adapters import find_adapter
