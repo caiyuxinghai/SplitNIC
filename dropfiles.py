@@ -1,67 +1,88 @@
 # -*- coding: utf-8 -*-
-"""Native Windows WM_DROPFILES hook so desktop icons can be dropped on CTk."""
+"""Resolve dropped files (.lnk / .exe) without flashing extra windows."""
 from __future__ import print_function
 
 import os
-import ctypes
-from ctypes import wintypes
+import re
+import struct
+import subprocess
 
-user32 = ctypes.windll.user32
-shell32 = ctypes.windll.shell32
-kernel32 = ctypes.windll.kernel32
-
-WM_DROPFILES = 0x0233
-GWLP_WNDPROC = -4
-GMEM_MOVEABLE = 0x0002
-
-LRESULT = ctypes.c_int64
-WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+CREATE_NO_WINDOW = 0x08000000
 
 
-class POINT(ctypes.Structure):
-    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+def run_hidden(args, timeout=8):
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0
+    return subprocess.check_output(
+        args,
+        stderr=subprocess.DEVNULL,
+        timeout=timeout,
+        startupinfo=si,
+        creationflags=CREATE_NO_WINDOW,
+    )
 
 
-shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
-shell32.DragQueryFileW.argtypes = [wintypes.HANDLE, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
-shell32.DragQueryFileW.restype = wintypes.UINT
-shell32.DragQueryPoint.argtypes = [wintypes.HANDLE, ctypes.POINTER(POINT)]
-shell32.DragFinish.argtypes = [wintypes.HANDLE]
-user32.CallWindowProcW.restype = LRESULT
-user32.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
-user32.SetWindowLongPtrW.restype = ctypes.c_void_p
-user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
-user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(POINT)]
+def _parse_lnk_binary(path):
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except Exception:
+        return ""
+    if len(data) < 0x4C or data[:4] != b"L\x00\x00\x00":
+        return ""
+    flags = struct.unpack_from("<I", data, 0x14)[0]
+    pos = 0x4C
+    try:
+        if flags & 0x01:
+            idlist_size = struct.unpack_from("<H", data, pos)[0]
+            pos += 2 + idlist_size
+        if flags & 0x02 and pos + 20 <= len(data):
+            local_off = struct.unpack_from("<I", data, pos + 16)[0]
+            header_size = struct.unpack_from("<I", data, pos + 4)[0]
+            uni_off = 0
+            if header_size >= 36 and pos + 32 <= len(data):
+                uni_off = struct.unpack_from("<I", data, pos + 28)[0]
+            if uni_off and pos + uni_off + 2 <= len(data):
+                start = pos + uni_off
+                end = data.find(b"\x00\x00", start)
+                if end > start:
+                    return data[start:end + 1].decode("utf-16le", "ignore").rstrip("\x00")
+            if local_off and pos + local_off < len(data):
+                start = pos + local_off
+                end = data.find(b"\x00", start)
+                if end > start:
+                    return data[start:end].decode("mbcs", "ignore")
+    except Exception:
+        pass
+    ascii_pat = re.compile(rb"[A-Za-z]:\\(?:[^\\\x00:*?\"<>|]+\\)*[^\\\x00:*?\"<>|]+\.[eE][xX][eE]")
+    m = ascii_pat.search(data)
+    if m:
+        return m.group().decode("mbcs", "ignore")
+    uni_pat = re.compile(
+        "(?:[A-Za-z]:\\\\(?:[^\\\\/:*?\"<>|\\x00]+\\\\)*[^\\\\/:*?\"<>|\\x00]+\\.[eE][xX][eE])".encode("utf-16le")
+    )
+    m = uni_pat.search(data)
+    if m:
+        return m.group().decode("utf-16le", "ignore")
+    return ""
 
 
 def resolve_lnk(path):
-    """Turn a .lnk into its target path. Leaves other files unchanged."""
     if not path:
         return ""
     path = os.path.abspath(path)
     if not path.lower().endswith(".lnk"):
         return path
+    target = _parse_lnk_binary(path)
+    if target and os.path.isfile(target):
+        return target
     try:
-        import win32com.client
-        target = win32com.client.Dispatch("WScript.Shell").CreateShortcut(path).TargetPath
-        if target:
-            return target
-    except Exception:
-        pass
-    try:
-        import subprocess
-        ps = (
-            "$s = New-Object -ComObject WScript.Shell; "
-            "$l = $s.CreateShortcut('%s'); "
-            "$t = $l.TargetPath; "
-            "if (-not $t) { $t = $l.FullName }; "
-            "Write-Output $t" % path.replace("'", "''")
-        )
-        out = subprocess.check_output(
-            ["powershell", "-NoProfile", "-STA", "-Command", ps],
-            stderr=subprocess.DEVNULL,
-        )
-        target = out.decode("utf-8", "ignore").strip()
+        raw = run_hidden([
+            "powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command",
+            "$s=New-Object -ComObject WScript.Shell; $s.CreateShortcut('%s').TargetPath" % path.replace("'", "''"),
+        ], timeout=6)
+        target = raw.decode("utf-8", "ignore").strip()
         if target:
             return target
     except Exception:
@@ -70,64 +91,47 @@ def resolve_lnk(path):
 
 
 def files_from_drop(paths):
-    """Accept .exe and desktop .lnk that point to .exe."""
     out = []
-    for raw in paths:
-        p = resolve_lnk(raw)
-        if p and os.path.isfile(p) and p.lower().endswith(".exe"):
-            out.append(p)
+    seen = set()
+    for raw in paths or []:
+        p = (raw or "").strip().strip("{}")
+        if not p:
+            continue
+        p = resolve_lnk(p)
+        if not p or not os.path.isfile(p):
+            continue
+        if not p.lower().endswith(".exe"):
+            continue
+        key = os.path.normcase(os.path.abspath(p))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(os.path.abspath(p))
     return out
 
 
-class FileDropHook(object):
-    def __init__(self, hwnd, callback):
-        self.hwnd = int(hwnd)
-        self.callback = callback
-        self._old_ptr = None
-        self._cb = WNDPROC(self._wndproc)
-        shell32.DragAcceptFiles(self.hwnd, True)
-        self._old_ptr = user32.SetWindowLongPtrW(
-            self.hwnd, GWLP_WNDPROC, ctypes.cast(self._cb, ctypes.c_void_p).value
-        )
-
-    def _wndproc(self, hwnd, msg, wparam, lparam):
-        if msg == WM_DROPFILES:
+def bind_drop(widget, handler):
+    """Register Windows file drop on a Tk/CTk widget if tkdnd is loaded."""
+    try:
+        from tkinterdnd2 import DND_FILES
+    except Exception:
+        return False
+    ok = False
+    candidates = [widget]
+    for attr in ("_canvas", "canvas", "_textbox"):
+        inner = getattr(widget, attr, None)
+        if inner is not None:
+            candidates.append(inner)
+    for w in candidates:
+        try:
+            w.drop_target_register(DND_FILES)
+            w.dnd_bind("<<Drop>>", handler)
+            ok = True
+        except Exception:
             try:
-                self._handle_drop(wparam)
+                w.tk.call("tkdnd::drop_target", "register", w._w, DND_FILES)
+                w.bind("<<Drop>>", handler)
+                ok = True
             except Exception:
-                pass
-            return 0
-        if self._old_ptr:
-            return user32.CallWindowProcW(self._old_ptr, hwnd, msg, wparam, lparam)
-        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
-
-    def _handle_drop(self, hdrop):
-        count = shell32.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
-        paths = []
-        buf = ctypes.create_unicode_buffer(1024)
-        for i in range(count):
-            n = shell32.DragQueryFileW(hdrop, i, buf, 1024)
-            if n:
-                paths.append(buf.value)
-        pt = POINT()
-        shell32.DragQueryPoint(hdrop, ctypes.byref(pt))
-        shell32.DragFinish(hdrop)
-        screen = POINT(pt.x, pt.y)
-        user32.ClientToScreen(self.hwnd, ctypes.byref(screen))
-        exes = files_from_drop(paths)
-        self.callback(exes, screen.x, screen.y, paths)
-
-
-def _root_hwnd(tk_widget):
-    hwnd = int(tk_widget.winfo_id())
-    user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
-    user32.GetAncestor.restype = wintypes.HWND
-    root = user32.GetAncestor(hwnd, 2)  # GA_ROOT
-    return int(root or hwnd)
-
-
-def install_drop(tk_widget, callback):
-    """Enable desktop-icon drop on a Tk/CTk window. Keep the return value alive."""
-    tk_widget.update_idletasks()
-    hwnd = _root_hwnd(tk_widget)
-    return FileDropHook(hwnd, callback)
+                continue
+    return ok

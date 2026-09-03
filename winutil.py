@@ -130,10 +130,15 @@ def _write_lnk(lnk_path, target, args, workdir, icon, description):
     if icon:
         ps += "$l.IconLocation = '%s'; " % q(icon)
     ps += "$l.Save();"
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0
     subprocess.check_call(
-        ["powershell", "-NoProfile", "-STA", "-Command", ps],
+        ["powershell", "-NoProfile", "-STA", "-WindowStyle", "Hidden", "-Command", ps],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        startupinfo=si,
+        creationflags=0x08000000,
     )
 
 

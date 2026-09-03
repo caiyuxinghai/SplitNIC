@@ -32,13 +32,20 @@ except Exception:
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
-CTkRoot = ctk.CTk
 HAS_DND = False
 try:
-    from tkinterdnd2 import TkinterDnD
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+
+    class CTkRoot(ctk.CTk, TkinterDnD.DnDWrapper):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.TkdndVersion = TkinterDnD._require(self)
+
     HAS_DND = True
 except Exception:
+    CTkRoot = ctk.CTk
     TkinterDnD = None
+    DND_FILES = None
 
 from adapters import usable_adapters, list_adapters, find_adapter, public_ip_via, KIND_LABELS
 from socks_proxy import ProxyPool
@@ -387,14 +394,8 @@ class SplitNICApp(CTkRoot):
         self.geometry("1280x760")
         self.minsize(980, 620)
         self.configure(fg_color="#0b0e14")
-        self._has_dnd = False
+        self._has_dnd = HAS_DND
         self._advanced = False
-        if HAS_DND and TkinterDnD is not None:
-            try:
-                self.TkdndVersion = TkinterDnD._require(self)
-                self._has_dnd = True
-            except Exception:
-                self._has_dnd = False
         icon_path = os.path.join(HERE, "assets", "icon.ico")
         if os.path.isfile(icon_path):
             try:
@@ -509,14 +510,14 @@ class SplitNICApp(CTkRoot):
             messagebox.showerror(APP_NAME, "提权失败。请右键「启动网口分流.bat」选择以管理员身份运行。")
 
     def _install_native_drop(self):
-        try:
-            from tkinterdnd2 import DND_FILES
-            from dropfiles import files_from_drop
-            self.drop_target_register(DND_FILES)
-            self.dnd_bind("<<Drop>>", self._on_tk_drop)
+        from dropfiles import bind_drop
+        ok = bind_drop(self, self._on_tk_drop)
+        if hasattr(self, "simple_board"):
+            self.simple_board.bind_os_drops()
+        if ok:
             self.log("已开启桌面图标拖入")
-        except Exception as exc:
-            self.log("桌面拖入安装失败：%s" % exc)
+        else:
+            self.log("桌面拖入未就绪：请用卡片上的「选择程序」按钮，或把图标拖到虚线框里再试")
 
     def _on_tk_drop(self, event):
         from dropfiles import files_from_drop
@@ -569,11 +570,17 @@ class SplitNICApp(CTkRoot):
     def add_exe_to_adapter(self, adapter, exe_path=None):
         if not exe_path:
             exe_path = filedialog.askopenfilename(
-                parent=self, title="选择要放到「%s」的程序" % (adapter.get("name") or "这张网"),
+                parent=self, title="选择要放到「%s」的程序" % (adapter.get("network_name") or adapter.get("name") or "这张网"),
                 filetypes=[("程序", "*.exe"), ("全部文件", "*.*")],
             )
         if not exe_path or not os.path.isfile(exe_path):
             return
+        exe_path = os.path.abspath(exe_path)
+        key = os.path.normcase(exe_path)
+        for r in self.config_data.get("rules") or []:
+            if os.path.normcase(os.path.abspath(r.get("exe") or "")) == key:
+                self.assign_rule_to_adapter(r, adapter)
+                return
         name = os.path.splitext(os.path.basename(exe_path))[0]
         rule = new_rule(
             name=name, exe=exe_path, mode=guess_mode(exe_path),
@@ -583,9 +590,12 @@ class SplitNICApp(CTkRoot):
         )
         self.config_data.setdefault("rules", []).append(rule)
         self.persist()
-        self.log("已放到 %s：%s" % (adapter.get("name"), name))
+        label = adapter.get("network_name") or adapter.get("name")
+        self.log("已放到 %s：%s" % (label, name))
         if hasattr(self, "simple_board"):
-            self.simple_board.set_status("已添加 %s → %s，点图标即可启动" % (name, adapter.get("name")))
+            self.simple_board.set_status("已显示在 %s：%s（点图标启动）" % (label, name))
+            self.simple_board.refresh()
+            self.simple_board.bind_os_drops()
 
     def assign_rule_to_adapter(self, rule, adapter):
         rid = rule.get("id")
@@ -596,9 +606,11 @@ class SplitNICApp(CTkRoot):
                 r["adapter_kind"] = adapter.get("kind") or ""
                 break
         self.persist()
-        self.log("%s → %s" % (rule.get("name"), adapter.get("name")))
+        label = adapter.get("network_name") or adapter.get("name")
+        self.log("%s → %s" % (rule.get("name"), label))
         if hasattr(self, "simple_board"):
-            self.simple_board.set_status("%s 现在走 %s" % (rule.get("name"), adapter.get("name")))
+            self.simple_board.set_status("%s 现在走 %s" % (rule.get("name"), label))
+            self.simple_board.refresh()
 
     def _build_main(self, tab):
         ctk.CTkLabel(tab, text="可用网卡", font=self.font_h).pack(anchor="w", pady=(4, 4))

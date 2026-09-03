@@ -313,19 +313,18 @@ _profile_cache = {"t": 0, "map": {}}
 def _connection_names():
     """InterfaceAlias -> {profile, ssid} from Windows."""
     import json
-    import subprocess
     import time
     now = time.time()
     if now - _profile_cache["t"] < 8 and _profile_cache["map"]:
         return _profile_cache["map"]
     mapping = {}
     try:
-        raw = subprocess.check_output(
+        from dropfiles import run_hidden
+        raw = run_hidden(
             [
-                "powershell", "-NoProfile", "-Command",
+                "powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command",
                 "Get-NetConnectionProfile | Select-Object Name, InterfaceAlias | ConvertTo-Json -Compress",
             ],
-            stderr=subprocess.DEVNULL,
             timeout=8,
         )
         data = json.loads(raw.decode("utf-8", "ignore") or "[]")
@@ -339,9 +338,9 @@ def _connection_names():
     except Exception:
         pass
     try:
-        raw = subprocess.check_output(
+        from dropfiles import run_hidden
+        raw = run_hidden(
             ["netsh", "wlan", "show", "interfaces"],
-            stderr=subprocess.DEVNULL,
             timeout=6,
         )
         text = raw.decode("gbk", "ignore") or raw.decode("utf-8", "ignore")

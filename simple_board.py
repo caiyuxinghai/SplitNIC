@@ -105,6 +105,7 @@ class SimpleBoard(ctk.CTkFrame):
             for rule in leftover:
                 tile = self._make_tile(row, rule, None)
                 tile.pack(side="left", padx=6, pady=4)
+        self.bind_os_drops()
 
     def _unassigned_rules(self, adapters):
         from adapters import find_adapter
@@ -201,7 +202,37 @@ class SimpleBoard(ctk.CTkFrame):
 
         self._zones[adapter.get("guid")] = zone
         self.after(20, _paint)
+        self._bind_adapter_drop(well, adapter)
+        self._bind_adapter_drop(zone, adapter)
         return zone
+
+    def bind_os_drops(self):
+        from dropfiles import bind_drop
+        bind_drop(self, lambda e: self.ctrl._on_tk_drop(e))
+        bind_drop(self.body, lambda e: self.ctrl._on_tk_drop(e))
+        for zone in self._zones.values():
+            adapter = zone._adapter
+            self._bind_adapter_drop(zone, adapter)
+            well = getattr(zone, "_well", None)
+            if well is not None:
+                self._bind_adapter_drop(well, adapter)
+
+    def _bind_adapter_drop(self, widget, adapter):
+        from dropfiles import bind_drop, files_from_drop
+
+        def handler(event, ad=adapter):
+            try:
+                parts = list(widget.tk.splitlist(getattr(event, "data", "")))
+            except Exception:
+                parts = [getattr(event, "data", "")]
+            exes = files_from_drop(parts)
+            if not exes:
+                self.set_status("请拖入程序或桌面快捷方式（.lnk / .exe）")
+                return
+            for exe in exes:
+                self.ctrl.add_exe_to_adapter(ad, exe_path=exe)
+
+        bind_drop(widget, handler)
 
     def _rules_for(self, adapter):
         from adapters import find_adapter
