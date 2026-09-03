@@ -97,6 +97,7 @@ kernel32.CreateProcessW.argtypes = [
     ctypes.POINTER(PROCESS_INFORMATION),
 ]
 kernel32.CreateProcessW.restype = wt.BOOL
+kernel32.VirtualAllocEx.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.c_size_t, wt.DWORD, wt.DWORD]
 kernel32.VirtualAllocEx.restype = ctypes.c_void_p
 kernel32.WriteProcessMemory.argtypes = [
     wt.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
@@ -105,10 +106,18 @@ kernel32.WriteProcessMemory.argtypes = [
 kernel32.GetModuleHandleW.restype = wt.HMODULE
 kernel32.GetProcAddress.restype = ctypes.c_void_p
 kernel32.GetProcAddress.argtypes = [wt.HMODULE, ctypes.c_char_p]
+kernel32.CreateRemoteThread.argtypes = [
+    wt.HANDLE, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
+    ctypes.c_void_p, wt.DWORD, ctypes.POINTER(wt.DWORD),
+]
 kernel32.CreateRemoteThread.restype = wt.HANDLE
+kernel32.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
+kernel32.WaitForSingleObject.restype = wt.DWORD
+kernel32.GetExitCodeThread.argtypes = [wt.HANDLE, ctypes.POINTER(wt.DWORD)]
 kernel32.ResumeThread.argtypes = [wt.HANDLE]
 kernel32.ResumeThread.restype = wt.DWORD
 kernel32.TerminateProcess.argtypes = [wt.HANDLE, wt.UINT]
+WAIT_TIMEOUT = 258
 
 
 def is_64bit_windows():
@@ -306,8 +315,15 @@ def inject_and_launch(exe_path, args, workdir, bind_ip, if_index, extra_env=None
         thread = kernel32.CreateRemoteThread(pi.hProcess, None, 0, load_lib, remote, 0, None)
         if not thread:
             raise OSError("CreateRemoteThread 失败，错误码 %s。杀毒软件可能拦截了注入。" % ctypes.get_last_error())
-        kernel32.WaitForSingleObject(thread, 8000)
+        wait_rc = kernel32.WaitForSingleObject(thread, 8000)
+        if wait_rc == WAIT_TIMEOUT:
+            kernel32.CloseHandle(thread)
+            raise OSError("注入超时：目标进程没有在 8 秒内加载 BindHook.dll。")
+        exit_code = wt.DWORD(0)
+        kernel32.GetExitCodeThread(thread, ctypes.byref(exit_code))
         kernel32.CloseHandle(thread)
+        if exit_code.value == 0:
+            raise OSError("LoadLibrary(BindHook.dll) 返回 0。请把本目录加入杀毒软件信任列表后再试。")
         kernel32.ResumeThread(pi.hThread)
         pid = pi.dwProcessId
         return pid
@@ -348,10 +364,12 @@ def launch_plain(exe_path, args, workdir, extra_env=None):
 
 
 def chromium_proxy_args(socks_port):
+    # Do NOT use MAP * ~NOTFOUND — that makes Chrome show "no internet"
+    # when the SOCKS handshake is even slightly off. TCP still leaves via
+    # the bound NIC; DNS may use the system resolver (documented limitation).
     return [
         "--proxy-server=socks5://127.0.0.1:%s" % socks_port,
         "--proxy-bypass-list=<-loopback>;localhost;127.0.0.1",
-        "--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1",
     ]
 
 

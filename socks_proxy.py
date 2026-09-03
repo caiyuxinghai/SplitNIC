@@ -84,12 +84,16 @@ class AdapterProxy(object):
                 pass
 
     def _open_remote(self, host, port):
+        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+        if not infos:
+            raise socket.gaierror("no IPv4 address for %s" % host)
+        _family, _type, _proto, _canon, sockaddr = infos[0]
         remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         remote.settimeout(15)
         if self.bind_ip:
             remote.bind((self.bind_ip, 0))
         apply_unicast_if(remote, self.if_index)
-        remote.connect((host, port))
+        remote.connect(sockaddr)
         remote.settimeout(None)
         return remote
 

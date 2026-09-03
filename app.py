@@ -34,6 +34,7 @@ from tkinter import filedialog, messagebox
 from adapters import usable_adapters, list_adapters, find_adapter, public_ip_via, KIND_LABELS
 from socks_proxy import ProxyPool
 from launcher import launch_app, list_running_processes, dll_path, guess_mode
+from diagnose import run_selftest
 
 APP_NAME = "网口分流"
 APP_NAME_EN = "SplitNIC"
@@ -364,18 +365,22 @@ class SplitNICApp(ctk.CTk):
         ctk.CTkLabel(header, text="  按软件选择走有线网还是无线网",
                      font=self.font, text_color="gray").pack(side="left", padx=(8, 0), pady=(8, 0))
 
-        self.admin_pill = ctk.CTkLabel(header, text="", font=self.font_small, width=140)
+        self.admin_pill = ctk.CTkLabel(header, text="", font=self.font_small, width=160)
         self.admin_pill.pack(side="right")
+        self.btn_elevate = ctk.CTkButton(header, text="获取管理员权限", width=130, command=self.elevate)
+        self.btn_elevate.pack(side="right", padx=8)
         self._set_admin_pill()
 
         self.tabs = ctk.CTkTabview(self)
         self.tabs.pack(fill="both", expand=True, padx=18, pady=(0, 8))
         self.tab_main = self.tabs.add("分流")
         self.tab_nics = self.tabs.add("网卡详情")
+        self.tab_diag = self.tabs.add("诊断")
         self.tab_help = self.tabs.add("使用说明与注意事项")
 
         self._build_main(self.tab_main)
         self._build_nics(self.tab_nics)
+        self._build_diag(self.tab_diag)
         self._build_help(self.tab_help)
 
         log_wrap = ctk.CTkFrame(self)
@@ -388,8 +393,15 @@ class SplitNICApp(ctk.CTk):
     def _set_admin_pill(self):
         if is_admin():
             self.admin_pill.configure(text="管理员  已获得", text_color="#22c55e")
+            self.btn_elevate.pack_forget()
         else:
-            self.admin_pill.configure(text="非管理员  部分功能不可用", text_color="#f59e0b")
+            self.admin_pill.configure(text="非管理员  网卡绑定可能失败", text_color="#f59e0b")
+
+    def elevate(self):
+        if relaunch_as_admin():
+            self.on_close()
+        else:
+            messagebox.showerror(APP_NAME, "提权失败。请右键「启动网口分流.bat」选择以管理员身份运行。")
 
     def _build_main(self, tab):
         ctk.CTkLabel(tab, text="可用网卡", font=self.font_h).pack(anchor="w", pady=(4, 4))
@@ -405,6 +417,8 @@ class SplitNICApp(ctk.CTk):
                       command=self.start_all).pack(side="right", padx=6)
         ctk.CTkButton(tools, text="刷新网卡", width=90, fg_color="gray",
                       command=self.refresh_adapters).pack(side="right", padx=6)
+        ctk.CTkButton(tools, text="运行诊断", width=90, fg_color="#0f766e",
+                      command=self.run_diagnose).pack(side="right", padx=6)
 
         self.rule_box = ctk.CTkScrollableFrame(tab, height=280)
         self.rule_box.pack(fill="both", expand=True, pady=(4, 8))
@@ -425,6 +439,15 @@ class SplitNICApp(ctk.CTk):
         self.nic_detail = ctk.CTkScrollableFrame(tab)
         self.nic_detail.pack(fill="both", expand=True, pady=8)
 
+    def _build_diag(self, tab):
+        top = ctk.CTkFrame(tab, fg_color="transparent")
+        top.pack(fill="x")
+        ctk.CTkButton(top, text="开始自检", width=120, command=self.run_diagnose).pack(side="left")
+        ctk.CTkLabel(top, text="会测试网卡、本地代理，并用记事本验证注入是否会把进程打崩。",
+                     font=self.font_small, text_color="gray").pack(side="left", padx=10)
+        self.diag_box = ctk.CTkTextbox(tab, font=ctk.CTkFont(family="Consolas", size=13))
+        self.diag_box.pack(fill="both", expand=True, pady=8)
+
     def _build_help(self, tab):
         box = ctk.CTkTextbox(tab, font=self.font)
         box.pack(fill="both", expand=True, pady=8)
@@ -433,14 +456,22 @@ class SplitNICApp(ctk.CTk):
 
     def log(self, msg):
         def _append():
-            self.log_box.configure(state="normal")
-            self.log_box.insert("end", msg + "\n")
-            self.log_box.see("end")
-            self.log_box.configure(state="disabled")
-        if threading.current_thread() is threading.main_thread():
-            _append()
-        else:
-            self.after(0, _append)
+            try:
+                if not self.winfo_exists():
+                    return
+                self.log_box.configure(state="normal")
+                self.log_box.insert("end", msg + "\n")
+                self.log_box.see("end")
+                self.log_box.configure(state="disabled")
+            except Exception:
+                pass
+        try:
+            if threading.current_thread() is threading.main_thread():
+                _append()
+            else:
+                self.after(0, _append)
+        except Exception:
+            pass
 
     def refresh_adapters(self):
         try:
@@ -630,11 +661,9 @@ class SplitNICApp(ctk.CTk):
             messagebox.showerror(APP_NAME, "规则「%s」指定的网卡当前不可用。请连接该网卡后刷新。" % rule.get("name"))
             return
         mode = rule.get("mode") or "auto"
-        if not is_admin() and mode in ("auto", "bind"):
-            if messagebox.askyesno(APP_NAME, "网卡绑定需要管理员权限。现在以管理员重新打开吗？\n（浏览器代理模式可以不提权）"):
-                if relaunch_as_admin():
-                    self.destroy()
-                return
+        resolved = mode if mode != "auto" else guess_mode(rule.get("exe") or "")
+        if not is_admin() and resolved == "bind":
+            self.log("未提权：仍尝试网卡绑定。若启动失败，请点右上角「获取管理员权限」。")
 
         def work():
             self._busy = True
@@ -658,10 +687,7 @@ class SplitNICApp(ctk.CTk):
             self.log("请等待当前启动完成。")
             return
         if not is_admin():
-            if messagebox.askyesno(APP_NAME, "批量启动里如果包含网卡绑定，需要管理员权限。现在以管理员重新打开吗？"):
-                if relaunch_as_admin():
-                    self.destroy()
-                return
+            self.log("未提权批量启动：网卡绑定类规则可能失败。")
 
         def work():
             self._busy = True
@@ -699,21 +725,34 @@ class SplitNICApp(ctk.CTk):
 
     def _warn_if_needed(self):
         if not is_admin():
-            if messagebox.askyesno(
-                APP_NAME,
-                "当前不是管理员。\n\n"
-                "「网卡绑定」WorkBuddy / VPN 需要管理员权限；\n"
-                "浏览器代理模式可以不提权。\n\n"
-                "要以管理员重新打开吗？",
-            ):
-                if relaunch_as_admin():
-                    self.destroy()
-                    return
+            self.log("当前不是管理员。浏览器代理可用；网卡绑定（WorkBuddy / VPN）若失败，请点右上角提权。")
         hook = dll_path()
         if not hook:
             self.log("未找到 BindHook.dll：网卡绑定模式不可用，浏览器代理模式仍可使用。运行 build.ps1 可编译该模块。")
         else:
             self.log("绑定模块：%s" % hook)
+
+    def run_diagnose(self):
+        self.tabs.set("诊断")
+        self.diag_box.delete("1.0", "end")
+        self.diag_box.insert("end", "正在自检，请稍等…\n")
+        self.log("开始自检…")
+
+        def work():
+            try:
+                report = run_selftest(include_inject=True)
+            except Exception:
+                report = traceback.format_exc()
+            def show():
+                try:
+                    self.diag_box.delete("1.0", "end")
+                    self.diag_box.insert("end", report)
+                    self.log("自检结束，请查看「诊断」页。")
+                except Exception:
+                    pass
+            self.after(0, show)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def on_close(self):
         try:
@@ -731,13 +770,35 @@ def main():
     app.mainloop()
 
 
+def write_error_log(text):
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        path = os.path.join(CONFIG_DIR, "error.log")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n----\n")
+            f.write(text)
+            f.write("\n")
+        return path
+    except Exception:
+        return None
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+        print(run_selftest())
+        sys.exit(0)
     try:
         main()
     except Exception:
+        err = traceback.format_exc()
         traceback.print_exc()
+        write_error_log(err)
         try:
-            messagebox.showerror(APP_NAME, traceback.format_exc())
+            messagebox.showerror(APP_NAME, err)
         except Exception:
             pass
         sys.exit(1)

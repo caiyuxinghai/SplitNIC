@@ -376,9 +376,10 @@ def public_ip_via(bind_ip, if_index, timeout=6):
     import ssl
 
     targets = [
-        ("api.ipify.org", 80, False, b"GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n"),
-        ("api.ipify.org", 443, True, b"GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n"),
+        ("4.ipw.cn", 80, False, b"GET / HTTP/1.1\r\nHost: 4.ipw.cn\r\nConnection: close\r\n\r\n"),
+        ("myip.ipip.net", 80, False, b"GET / HTTP/1.1\r\nHost: myip.ipip.net\r\nConnection: close\r\n\r\n"),
         ("icanhazip.com", 80, False, b"GET / HTTP/1.1\r\nHost: icanhazip.com\r\nConnection: close\r\n\r\n"),
+        ("api.ipify.org", 80, False, b"GET / HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n"),
     ]
     errors = []
     for host, port, use_ssl, req in targets:
@@ -394,7 +395,14 @@ def public_ip_via(bind_ip, if_index, timeout=6):
                 stream = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
             stream.sendall(req)
             body = _read_http_body(stream)
-            ip = _looks_like_ip(body.splitlines()[0] if body else "")
+            first = (body.splitlines()[0] if body else "").strip()
+            ip = _looks_like_ip(first)
+            if not ip:
+                # ipip.net returns "当前 IP：x.x.x.x 来自于..."
+                for token in first.replace("：", " ").replace(":", " ").split():
+                    ip = _looks_like_ip(token)
+                    if ip:
+                        break
             if ip:
                 return ip
             errors.append("%s:%s unexpected %r" % (host, port, (body or "")[:60]))

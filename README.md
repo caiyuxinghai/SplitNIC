@@ -103,6 +103,26 @@ pyinstaller --noconfirm --windowed --name SplitNIC --manifest app.manifest --add
 - 普通程序分流：`CreateProcess(CREATE_SUSPENDED)` → 远程 `LoadLibrary(BindHook.dll)` → 挂钩 `connect` / `WSAConnect` / `sendto` 等，在连接前绑定指定接口
 - Windows 默认是弱主机模型，只 `bind` 源 IP 不够，所以同时设置 `IP_UNICAST_IF`
 
+## 自检 / 排错
+
+程序里打开「诊断」页点「开始自检」，或命令行：
+
+```powershell
+python app.py --selftest
+```
+
+会检查：管理员权限、BindHook.dll 能否加载、网卡是否 ≥ 2 张、每张网卡绑定出口、本地 SOCKS 代理、向 notepad.exe 注入后进程是否还活着。
+
+崩溃日志：`%APPDATA%\SplitNIC\error.log`  
+注入日志：`%TEMP%\splitnic-bindhook.log`
+
+常见问题：
+
+- 双击 bat 一闪而过：以管理员运行后找不到 Python。bat 会优先用 `%LocalAppData%\Programs\Python\Python3xx\python.exe`。
+- 一点启动软件就闪退：旧版用了不安全的 12 字节 inline hook，已改为 IAT 挂钩。
+- 浏览器显示没网：已去掉会把 Chrome DNS 全部打成 NOTFOUND 的启动参数。
+- 启动后弹出「要以管理员重新打开吗」然后界面没了：已改成右上角按钮，不再强制弹窗关窗。
+
 ## 配置文件
 
 ```
