@@ -127,16 +127,21 @@ class SimpleBoard(ctk.CTkFrame):
 
         head = ctk.CTkFrame(zone, fg_color="transparent")
         head.pack(fill="x", padx=22, pady=(16, 4))
+        net_name = adapter.get("network_name") or adapter.get("name") or style["title"]
         ctk.CTkLabel(
-            head, text=style["title"], anchor="w",
-            font=ctk.CTkFont(family="Microsoft YaHei UI", size=26, weight="bold"),
+            head, text=net_name,
+            anchor="w",
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=28, weight="bold"),
             text_color="#f8fafc",
         ).pack(anchor="w")
+        bits = [style["title"]]
+        if adapter.get("name") and adapter.get("name") != net_name:
+            bits.append(adapter.get("name"))
         ctk.CTkLabel(
-            head, text=adapter.get("name") or "",
+            head, text="  ·  ".join(bits),
             anchor="w", text_color=color,
-            font=ctk.CTkFont(family="Microsoft YaHei UI", size=14),
-        ).pack(anchor="w")
+            font=ctk.CTkFont(family="Microsoft YaHei UI", size=15),
+        ).pack(anchor="w", pady=(2, 0))
         ip = (adapter.get("ipv4") or ["-"])[0]
         pub = self.ctrl._adapter_pub.get(adapter.get("guid"))
         sub = ip if not pub else "%s   出口 %s" % (ip, pub)
@@ -155,14 +160,20 @@ class SimpleBoard(ctk.CTkFrame):
             pad = 10
             c.create_rectangle(pad, pad, w - pad, h - pad, outline=col, width=2, dash=(10, 7))
             rules = self._rules_for(ad)
+            net_name = ad.get("network_name") or ad.get("name") or style["title"]
+            c.create_text(
+                w / 2, 36,
+                text=net_name,
+                fill=col, font=("Microsoft YaHei UI", 20, "bold"),
+            )
             if not rules:
                 c.create_text(
-                    w / 2, h / 2 - 12,
+                    w / 2, h / 2 - 4,
                     text="把桌面上的应用图标拖到这里",
-                    fill=col, font=("Microsoft YaHei UI", 16, "bold"),
+                    fill="#dbeafe", font=("Microsoft YaHei UI", 16, "bold"),
                 )
                 c.create_text(
-                    w / 2, h / 2 + 18,
+                    w / 2, h / 2 + 26,
                     text=style["hint"],
                     fill="#8aa0b8", font=("Microsoft YaHei UI", 12),
                 )

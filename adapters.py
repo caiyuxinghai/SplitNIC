@@ -307,6 +307,78 @@ def list_adapters(include_down=True, include_loopback=False):
     return adapters
 
 
+_profile_cache = {"t": 0, "map": {}}
+
+
+def _connection_names():
+    """InterfaceAlias -> {profile, ssid} from Windows."""
+    import json
+    import subprocess
+    import time
+    now = time.time()
+    if now - _profile_cache["t"] < 8 and _profile_cache["map"]:
+        return _profile_cache["map"]
+    mapping = {}
+    try:
+        raw = subprocess.check_output(
+            [
+                "powershell", "-NoProfile", "-Command",
+                "Get-NetConnectionProfile | Select-Object Name, InterfaceAlias | ConvertTo-Json -Compress",
+            ],
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+        )
+        data = json.loads(raw.decode("utf-8", "ignore") or "[]")
+        if isinstance(data, dict):
+            data = [data]
+        for row in data or []:
+            alias = (row.get("InterfaceAlias") or "").strip()
+            name = (row.get("Name") or "").strip()
+            if alias:
+                mapping.setdefault(alias, {})["profile"] = name
+    except Exception:
+        pass
+    try:
+        raw = subprocess.check_output(
+            ["netsh", "wlan", "show", "interfaces"],
+            stderr=subprocess.DEVNULL,
+            timeout=6,
+        )
+        text = raw.decode("gbk", "ignore") or raw.decode("utf-8", "ignore")
+        alias = ""
+        ssid = ""
+        for line in text.splitlines():
+            s = line.strip()
+            low = s.lower()
+            if s.startswith("名称") or low.startswith("name"):
+                if "ssid" not in low:
+                    alias = s.split(":", 1)[-1].strip()
+            if s.startswith("SSID") or "SSID" in s[:8]:
+                if "BSSID" not in s.upper()[:6]:
+                    ssid = s.split(":", 1)[-1].strip()
+            if alias and ssid:
+                mapping.setdefault(alias, {})["ssid"] = ssid
+                alias, ssid = "", ""
+    except Exception:
+        pass
+    _profile_cache["t"] = now
+    _profile_cache["map"] = mapping
+    return mapping
+
+
+def attach_network_names(adapters):
+    names = _connection_names()
+    for a in adapters:
+        info = names.get(a.get("name") or "") or {}
+        a["profile"] = info.get("profile") or ""
+        a["ssid"] = info.get("ssid") or ""
+        hero = a["ssid"] or a["profile"] or a.get("name") or ""
+        if hero.lower() in ("network", "网络", "unidentified network", "未识别的网络"):
+            hero = a.get("name") or hero
+        a["network_name"] = hero
+    return adapters
+
+
 def usable_adapters():
     """Connected adapters that can actually carry app traffic."""
     out = []
@@ -317,7 +389,7 @@ def usable_adapters():
             out.append(a)
         elif a["up"] and a["kind"] in ("wired", "wifi", "vpn"):
             out.append(a)
-    return out
+    return attach_network_names(out)
 
 
 def find_adapter(adapters, guid=None, name=None, kind=None):
