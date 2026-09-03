@@ -32,18 +32,13 @@ except Exception:
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
+CTkRoot = ctk.CTk
+HAS_DND = False
 try:
     from tkinterdnd2 import TkinterDnD
-
-    class CTkRoot(ctk.CTk, TkinterDnD.DnDWrapper):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.TkdndVersion = TkinterDnD._require(self)
-
     HAS_DND = True
 except Exception:
-    CTkRoot = ctk.CTk
-    HAS_DND = False
+    TkinterDnD = None
 
 from adapters import usable_adapters, list_adapters, find_adapter, public_ip_via, KIND_LABELS
 from socks_proxy import ProxyPool
@@ -392,8 +387,14 @@ class SplitNICApp(CTkRoot):
         self.geometry("1280x760")
         self.minsize(980, 620)
         self.configure(fg_color="#0b0e14")
-        self._has_dnd = HAS_DND
+        self._has_dnd = False
         self._advanced = False
+        if HAS_DND and TkinterDnD is not None:
+            try:
+                self.TkdndVersion = TkinterDnD._require(self)
+                self._has_dnd = True
+            except Exception:
+                self._has_dnd = False
         icon_path = os.path.join(HERE, "assets", "icon.ico")
         if os.path.isfile(icon_path):
             try:
@@ -435,8 +436,19 @@ class SplitNICApp(CTkRoot):
         self.after(900, self._run_pending)
         self.after(1200, self._schedule_auto_refresh)
         self.bind("<F5>", lambda e: self.refresh_adapters())
+        self.after(80, self._force_show)
         if self._start_minimized:
-            self.after(150, self.withdraw)
+            self.after(400, self.withdraw)
+
+    def _force_show(self):
+        try:
+            self.deiconify()
+            self.lift()
+            self.state("normal")
+            self.attributes("-topmost", True)
+            self.after(600, lambda: self.attributes("-topmost", False))
+        except Exception:
+            pass
 
     def _build(self):
         header = ctk.CTkFrame(self, fg_color="transparent")
@@ -498,11 +510,24 @@ class SplitNICApp(CTkRoot):
 
     def _install_native_drop(self):
         try:
-            from dropfiles import install_drop
-            self._drop_hook = install_drop(self, self._on_desktop_drop)
+            from tkinterdnd2 import DND_FILES
+            from dropfiles import files_from_drop
+            self.drop_target_register(DND_FILES)
+            self.dnd_bind("<<Drop>>", self._on_tk_drop)
             self.log("已开启桌面图标拖入")
         except Exception as exc:
             self.log("桌面拖入安装失败：%s" % exc)
+
+    def _on_tk_drop(self, event):
+        from dropfiles import files_from_drop
+        try:
+            parts = list(self.tk.splitlist(event.data))
+        except Exception:
+            parts = [getattr(event, "data", "")]
+        exes = files_from_drop(parts)
+        x = int(self.winfo_pointerx())
+        y = int(self.winfo_pointery())
+        self._on_desktop_drop(exes, x, y, parts)
 
     def _on_desktop_drop(self, exes, x, y, raw=None):
         if getattr(self, "_advanced", False):

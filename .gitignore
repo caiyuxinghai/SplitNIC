@@ -15,3 +15,5 @@ tools/
 .DS_Store
 Thumbs.db
 *.tmp
+assets/preview*.png
+_show.py
