@@ -44,7 +44,7 @@ from adapters import usable_adapters, list_adapters, find_adapter, public_ip_via
 from socks_proxy import ProxyPool
 from launcher import (
     launch_app, list_running_processes, dll_path, guess_mode,
-    is_rule_running, stop_rule_processes,
+    is_rule_running, stop_rule_processes, has_anticheat,
 )
 from diagnose import run_selftest
 from simple_board import SimpleBoard
@@ -644,11 +644,32 @@ class SplitNICApp(ctk.CTkFrame):
         self.config_data.setdefault("rules", []).append(rule)
         self.persist()
         label = adapter.get("network_name") or adapter.get("name")
-        self.log("已放到 %s：%s" % (label, name))
+        self.log("已找到程序 %s → 放到 %s" % (exe_path, label))
         if hasattr(self, "simple_board"):
-            self.simple_board.set_status("已显示在 %s：%s（点图标启动）" % (label, name))
+            self.simple_board.set_status("已找到 %s，放到 %s" % (os.path.basename(exe_path), label))
             self.simple_board.refresh()
             self.simple_board.bind_os_drops()
+        self._after_rule_placed(rule, adapter)
+
+    def _after_rule_placed(self, rule, adapter):
+        exe = rule.get("exe") or ""
+        label = adapter.get("network_name") or adapter.get("name")
+        if has_anticheat(exe):
+            msg = (
+                "已找到对应程序：\n%s\n\n"
+                "已放到「%s」，但这个游戏带反作弊，不能用网卡绑定分流"
+                "（注入会被当成外挂，也可能根本绑不上）。\n\n"
+                "分流请用抖音、Chrome、WorkBuddy、VPN 客户端这类软件；"
+                "游戏请走系统默认网卡。"
+            ) % (exe, label)
+            self.log(msg.replace("\n", " "))
+            if hasattr(self, "simple_board"):
+                self.simple_board.set_status("已找到 %s，但这是带反作弊的游戏，不能分流" % os.path.basename(exe))
+            self.after(0, lambda: messagebox.showwarning(APP_NAME, msg))
+            return
+        if hasattr(self, "simple_board"):
+            self.simple_board.set_status("已找到 %s，正在用「%s」启动…" % (os.path.basename(exe), label))
+        self.start_rule(rule)
 
     def assign_rule_to_adapter(self, rule, adapter):
         rid = rule.get("id")
@@ -660,10 +681,11 @@ class SplitNICApp(ctk.CTkFrame):
                 break
         self.persist()
         label = adapter.get("network_name") or adapter.get("name")
-        self.log("%s → %s" % (rule.get("name"), label))
+        self.log("%s → %s（%s）" % (rule.get("name"), label, rule.get("exe")))
         if hasattr(self, "simple_board"):
             self.simple_board.set_status("%s 现在走 %s" % (rule.get("name"), label))
             self.simple_board.refresh()
+        self._after_rule_placed(rule, adapter)
 
     def _build_main(self, tab):
         ctk.CTkLabel(tab, text="可用网卡", font=self.font_h).pack(anchor="w", pady=(4, 4))

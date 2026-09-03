@@ -37,6 +37,20 @@ CHROMIUM_LIKE = BROWSER_NAMES | {
     "msedgewebview2.exe",
 }
 
+# DLL injection into these is blocked or treated as a cheat.
+ANTICHEAT_MARKERS = (
+    "valorant", "vanguard", "riot client", "league of legends",
+    "starrail", "star rail", "yuanshen", "genshin", "zenless",
+    "delta_force", "delta force", "easyanticheat", "eac_",
+    "battleye", "easy anti-cheat",
+)
+
+
+def has_anticheat(exe_path):
+    blob = os.path.normcase(exe_path or "")
+    name = os.path.basename(blob)
+    return any(m in blob or m in name for m in ANTICHEAT_MARKERS)
+
 
 class SECURITY_ATTRIBUTES(ctypes.Structure):
     _fields_ = [
@@ -370,14 +384,34 @@ def close_by_exe(exe_path, timeout=8):
 
 
 def _env_block(extra):
-    env = os.environ.copy()
-    env.update(extra)
-    # UTF-16LE block, each entry KEY=VAL\0, terminated by extra \0
+    """Build a CREATE_UNICODE_ENVIRONMENT block (UTF-16LE, double-NUL ended).
+
+    ctypes.create_unicode_buffer(s) stops at the first embedded NUL, so the
+    process would only receive the first variable and BindHook would log
+    SPLITNIC_BIND_IP missing — traffic then uses the default NIC.
+    """
+    env = {}
+    for k, v in os.environ.items():
+        if k is None or v is None:
+            continue
+        env[str(k)] = str(v)
+    if extra:
+        for k, v in extra.items():
+            if k is None or v is None:
+                continue
+            env[str(k)] = str(v)
     parts = []
+    for key in ("SPLITNIC_BIND_IP", "SPLITNIC_IFINDEX"):
+        if key in env:
+            parts.append("%s=%s" % (key, env[key]))
     for k, v in env.items():
+        if k in ("SPLITNIC_BIND_IP", "SPLITNIC_IFINDEX"):
+            continue
         parts.append("%s=%s" % (k, v))
-    raw = "\0".join(parts) + "\0\0"
-    return ctypes.create_unicode_buffer(raw)
+    payload = ("\0".join(parts) + "\0\0").encode("utf-16le")
+    buf = ctypes.create_string_buffer(len(payload) + 4)
+    ctypes.memmove(buf, payload, len(payload))
+    return buf
 
 
 def inject_and_launch(exe_path, args, workdir, bind_ip, if_index, extra_env=None):
@@ -611,6 +645,12 @@ def launch_app(rule, adapter, proxy_pool, log=lambda m: None):
         return pid, "浏览器/代理分流 → %s" % bind_ip
 
     if mode == "bind":
+        if has_anticheat(exe):
+            raise RuntimeError(
+                "「%s」带反作弊，不能用网卡绑定（注入会被当成外挂）。"
+                "请改用浏览器/抖音这类软件分流，或换一张系统默认网卡来打游戏。"
+                % os.path.basename(exe)
+            )
         pid = inject_and_launch(exe, args, workdir, bind_ip, if_index)
         return pid, "网卡绑定启动 → %s" % bind_ip
 

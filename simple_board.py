@@ -36,7 +36,7 @@ class SimpleBoard(ctk.CTkFrame):
 
         self.hint = ctk.CTkLabel(
             self,
-            text="从桌面把应用快捷方式拖进对应网络  ·  点图标启动  ·  不要用管理员打开",
+            text="拖进快捷方式会自动找到对应 .exe 并用这张网启动  ·  不要从桌面再开一次",
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=15),
             text_color="#9fb0c8",
         )
