@@ -17,3 +17,4 @@ Thumbs.db
 *.tmp
 assets/preview*.png
 _show.py
+native/*.def
