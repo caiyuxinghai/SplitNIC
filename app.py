@@ -51,7 +51,7 @@ from simple_board import SimpleBoard
 from winutil import (
     ensure_single_instance, create_desktop_shortcuts, set_start_with_windows,
     is_start_with_windows, create_rule_shortcut, create_all_rule_shortcuts,
-    post_ipc, drain_ipc, bring_existing_to_front,
+    post_ipc, drain_ipc, bring_existing_to_front, spawn_unelevated_self,
 )
 
 APP_NAME = "网口分流"
@@ -84,9 +84,9 @@ HELP_TEXT = """\
   · 无线网  →  抖音、Chrome / Edge / 浏览器
 
 【怎么用】
-1. 先用管理员身份打开本程序（绑定网卡需要管理员权限）。
-2. 确认顶部「可用网卡」里至少有 2 张已连接、有 IPv4 的网卡。
-3. 默认是简洁模式：把软件拖到「有线网」或「无线网」方块里，点图标就能启动。
+1. 用普通方式打开（不要「以管理员运行」）。管理员窗口会被 Windows 禁止从桌面拖入图标。
+2. 确认顶部同时出现有线网和无线网。
+3. 把桌面上的应用快捷方式拖到对应网络卡片里，点图标就能启动。网卡绑定失败时再点右上角「管理员」。
 4. 右上角「高级模式」才是原来的表格、诊断和手动配置。
 5. 右键图标可以放到桌面、改详细设置或移除。
 
@@ -129,13 +129,17 @@ def is_admin():
 
 
 def relaunch_as_admin():
-    params = " ".join('"%s"' % a if " " in a else a for a in sys.argv)
+    extra = [a for a in sys.argv[1:] if a != "--elevated"]
+    extra.append("--elevated")
     if getattr(sys, "frozen", False):
         exe = sys.executable
-        args = " ".join('"%s"' % a if " " in a else a for a in sys.argv[1:])
+        args = " ".join('"%s"' % a if " " in a else a for a in extra)
     else:
         exe = sys.executable
-        args = '"%s" %s' % (os.path.abspath(sys.argv[0]), " ".join(sys.argv[1:]))
+        args = '"%s" %s' % (
+            os.path.abspath(sys.argv[0]),
+            " ".join('"%s"' % a if " " in a else a for a in extra),
+        )
     rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, args, None, 1)
     return rc > 32
 
@@ -413,9 +417,11 @@ class SplitNICApp(ctk.CTkFrame):
         self.refresh_adapters()
         self.render_rules()
         self._drop_hook = None
+        self._ole_site = None
         self._drop_guard = (0, ())
         self.after(200, self._warn_if_needed)
         self.after(300, self._install_native_drop)
+        self.after(800, self._ensure_normal_shortcut)
         self.after(400, self._start_tray)
         self.after(700, self._poll_ipc)
         self.after(900, self._run_pending)
@@ -484,30 +490,81 @@ class SplitNICApp(ctk.CTkFrame):
             self.admin_pill.configure(text="管理员", text_color="#34d399")
             self.btn_elevate.pack_forget()
         else:
-            self.admin_pill.configure(text="未提权", text_color="#fbbf24")
+            self.admin_pill.configure(text="普通权限", text_color="#fbbf24")
 
     def elevate(self):
         if relaunch_as_admin():
             self.on_close()
         else:
-            messagebox.showerror(APP_NAME, "提权失败。请右键「启动网口分流.bat」选择以管理员身份运行。")
+            messagebox.showerror(APP_NAME, "提权失败。网卡绑定不是必须提权；浏览器/抖音用代理模式即可。")
+
+    def _ensure_normal_shortcut(self):
+        """Desktop shortcut must NOT request admin, or Explorer drag-drop is blocked."""
+        try:
+            create_desktop_shortcuts(run_as_admin=False)
+        except Exception:
+            pass
 
     def _install_native_drop(self):
-        ok = False
+        try:
+            from ole_drop import OleDropSite
+        except Exception as exc:
+            self.log("系统拖放模块加载失败：%s" % exc)
+            OleDropSite = None
+        if OleDropSite is not None:
+            if self._ole_site is None:
+                self._ole_site = OleDropSite(
+                    self.root,
+                    on_drop=self._on_ole_drop,
+                    on_over=self._on_ole_over,
+                    on_leave=self._on_ole_leave,
+                )
+            added = 0
+            try:
+                added = self._ole_site.install()
+            except Exception as exc:
+                self.log("系统拖放注册失败：%s" % exc)
+            n = self._ole_site.registered_count()
+            if added and not getattr(self, "_ole_logged", False):
+                self.log("系统拖放已接管 %d 个窗口，可把桌面快捷方式拖进网卡" % n)
+                self._ole_logged = True
+            elif n == 0 and self._ole_site.last_error:
+                self.log("系统拖放未就绪：%s" % self._ole_site.last_error)
         if HAS_DND and DND_FILES:
             try:
-                self.root.drop_target_register(DND_FILES)
-                self.root.dnd_bind("<<Drop>>", self._on_tk_drop)
-                ok = True
+                from dropfiles import bind_drop
+                bind_drop(self.root, self._on_tk_drop)
             except Exception as exc:
-                self.log("根窗口拖入失败：%s" % exc)
+                self.log("tkdnd 备用拖入失败：%s" % exc)
         if hasattr(self, "simple_board"):
             self.simple_board.bind_os_drops()
-            ok = True
-        if ok:
-            self.log("可以把桌面快捷方式拖进有线网 / 无线网")
-        else:
-            self.log("拖入未就绪：请点卡片上的「选择程序」")
+        if is_admin():
+            self.log("当前是管理员：Windows 会禁止从桌面拖文件进来。请关掉后用桌面「网口分流」普通打开。")
+            if hasattr(self, "simple_board"):
+                self.simple_board.set_status("管理员窗口拖不进桌面图标。请关掉，用普通方式打开后再拖")
+
+    def _on_ole_drop(self, files, x, y):
+        from dropfiles import files_from_drop
+        exes = files_from_drop(files)
+        self.log("拖入：%s → %s" % (
+            "；".join(os.path.basename(p) for p in (files or [])),
+            "；".join(os.path.basename(e) for e in exes) or "未能识别",
+        ))
+        self._on_desktop_drop(exes, int(x), int(y), files)
+
+    def _on_ole_over(self, x, y):
+        if getattr(self, "_advanced", False):
+            return
+        board = getattr(self, "simple_board", None)
+        if board is None:
+            return
+        zone = board._zone_at(x, y)
+        board._set_hot(zone._guid if zone is not None else None)
+
+    def _on_ole_leave(self):
+        board = getattr(self, "simple_board", None)
+        if board is not None:
+            board._set_hot(None)
 
     def _on_tk_drop(self, event):
         from dropfiles import files_from_drop
@@ -681,7 +738,7 @@ class SplitNICApp(ctk.CTkFrame):
                         variable=self.var_tray, command=self._save_settings).pack(anchor="w", pady=6)
         ctk.CTkCheckBox(wrap, text="自动刷新网卡（约 20 秒，网卡插拔后不用手点刷新）",
                         variable=self.var_auto, command=self._save_settings).pack(anchor="w", pady=6)
-        ctk.CTkCheckBox(wrap, text="开机自动启动（管理员；启动后按规则自动拉起勾了「自动启动」的软件）",
+        ctk.CTkCheckBox(wrap, text="开机自动启动（启动后按规则自动拉起勾了「自动启动」的软件）",
                         variable=self.var_boot, command=self._toggle_autostart).pack(anchor="w", pady=6)
         ctk.CTkCheckBox(wrap, text="网卡重新连上后，自动启动绑在这张卡上、且当时没在运行的软件",
                         variable=self.var_nic_launch, command=self._save_settings).pack(anchor="w", pady=6)
@@ -735,9 +792,9 @@ class SplitNICApp(ctk.CTkFrame):
 
     def make_desktop_shortcut(self):
         try:
-            created = create_desktop_shortcuts(run_as_admin=True)
+            created = create_desktop_shortcuts(run_as_admin=False)
             self.log("已创建桌面快捷方式：%s" % " ； ".join(created))
-            messagebox.showinfo(APP_NAME, "已在桌面创建「网口分流」快捷方式。\n双击会请求管理员权限。")
+            messagebox.showinfo(APP_NAME, "已在桌面创建「网口分流」快捷方式。\n请用这个图标打开（不要选以管理员运行），才能把桌面应用拖进来。")
         except Exception as exc:
             messagebox.showerror(APP_NAME, "创建快捷方式失败：%s" % exc)
 
@@ -1239,7 +1296,7 @@ class SplitNICApp(ctk.CTkFrame):
 
     def _warn_if_needed(self):
         if not is_admin():
-            self.log("当前不是管理员。浏览器代理可用；网卡绑定（WorkBuddy / VPN）若失败，请点右上角提权。")
+            self.log("当前是普通权限，可以从桌面拖入图标。网卡绑定失败时再点右上角「管理员」。")
         hook = dll_path()
         if not hook:
             self.log("未找到 BindHook.dll：网卡绑定模式不可用，浏览器代理模式仍可使用。运行 build.ps1 可编译该模块。")
@@ -1362,6 +1419,9 @@ def parse_cli(argv):
             minimized = True
             i += 1
             continue
+        if a in ("--elevated", "--keep-admin"):
+            i += 1
+            continue
         i += 1
     cmds = []
     if launch_all:
@@ -1373,6 +1433,23 @@ def parse_cli(argv):
 
 def main():
     cmds, minimized = parse_cli(sys.argv[1:])
+    # Explorer cannot drop files onto an elevated window (UIPI → 🚫).
+    # If this process was started "as admin" by the old shortcut, restart
+    # at normal integrity unless the user explicitly clicked 管理员.
+    if (
+        is_admin()
+        and "--elevated" not in sys.argv
+        and "--keep-admin" not in sys.argv
+        and "--selftest" not in sys.argv
+    ):
+        try:
+            create_desktop_shortcuts(run_as_admin=False)
+        except Exception:
+            pass
+        for cmd in cmds:
+            post_ipc(cmd)
+        if spawn_unelevated_self(sys.argv[1:]):
+            return
     if not ensure_single_instance():
         for cmd in cmds:
             post_ipc(cmd)

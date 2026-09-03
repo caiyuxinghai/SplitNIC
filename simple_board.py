@@ -36,7 +36,7 @@ class SimpleBoard(ctk.CTkFrame):
 
         self.hint = ctk.CTkLabel(
             self,
-            text="从桌面把应用图标拖进左边或右边的网络  ·  点图标启动",
+            text="从桌面把应用快捷方式拖进对应网络  ·  点图标启动  ·  不要用管理员打开",
             font=ctk.CTkFont(family="Microsoft YaHei UI", size=15),
             text_color="#9fb0c8",
         )
@@ -106,6 +106,11 @@ class SimpleBoard(ctk.CTkFrame):
                 tile = self._make_tile(row, rule, None)
                 tile.pack(side="left", padx=6, pady=4)
         self.bind_os_drops()
+        # New CTk widgets create new HWNDs; re-register OLE drop targets.
+        try:
+            self.after(50, self.ctrl._install_native_drop)
+        except Exception:
+            pass
 
     def _unassigned_rules(self, adapters):
         from adapters import find_adapter
@@ -155,6 +160,11 @@ class SimpleBoard(ctk.CTkFrame):
         zone._color = color
 
         def _paint(event=None, c=well, col=color, ad=adapter):
+            try:
+                if not c.winfo_exists():
+                    return
+            except tk.TclError:
+                return
             c.delete("all")
             w = max(c.winfo_width(), 40)
             h = max(c.winfo_height(), 40)
