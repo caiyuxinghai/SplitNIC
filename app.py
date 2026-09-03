@@ -426,7 +426,10 @@ class SplitNICApp(CTkRoot):
         self._build()
         self.refresh_adapters()
         self.render_rules()
+        self._drop_hook = None
+        self._drop_guard = (0, ())
         self.after(200, self._warn_if_needed)
+        self.after(300, self._install_native_drop)
         self.after(400, self._start_tray)
         self.after(700, self._poll_ipc)
         self.after(900, self._run_pending)
@@ -492,6 +495,38 @@ class SplitNICApp(CTkRoot):
             self.on_close()
         else:
             messagebox.showerror(APP_NAME, "提权失败。请右键「启动网口分流.bat」选择以管理员身份运行。")
+
+    def _install_native_drop(self):
+        try:
+            from dropfiles import install_drop
+            self._drop_hook = install_drop(self, self._on_desktop_drop)
+            self.log("已开启桌面图标拖入")
+        except Exception as exc:
+            self.log("桌面拖入安装失败：%s" % exc)
+
+    def _on_desktop_drop(self, exes, x, y, raw=None):
+        if getattr(self, "_advanced", False):
+            return
+        key = tuple(exes or [])
+        now = time.time()
+        if key and key == self._drop_guard[1] and (now - self._drop_guard[0]) < 0.6:
+            return
+        self._drop_guard = (now, key)
+        board = getattr(self, "simple_board", None)
+        if board is None:
+            return
+        zone = board._zone_at(x, y)
+        if not exes:
+            board.set_status("请拖入程序图标（桌面快捷方式或 .exe）")
+            board.flash_zones()
+            return
+        if zone is None:
+            board.set_status("请拖到「有线网」或「无线网」那一张卡片上")
+            board.flash_zones()
+            return
+        for exe in exes:
+            self.add_exe_to_adapter(zone._adapter, exe_path=exe)
+        board._set_hot(None)
 
     def toggle_advanced(self):
         self._advanced = not self._advanced
