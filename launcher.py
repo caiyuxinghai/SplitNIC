@@ -169,6 +169,74 @@ def dll_path():
     return None
 
 
+def _adapter_key(rule):
+    raw = rule.get("adapter_guid") or rule.get("adapter_name") or "nic"
+    return "".join(ch if ch.isalnum() else "_" for ch in str(raw))[:40]
+
+
+def rule_uses_isolated_profile(rule):
+    if not rule or not rule.get("isolated_profile", True):
+        return False
+    exe = rule.get("exe") or ""
+    mode = rule.get("mode") or "auto"
+    if mode == "auto":
+        mode = guess_mode(exe)
+    if mode != "proxy":
+        return False
+    return is_firefox(exe) or is_chromium_like(exe)
+
+
+def isolated_profile_path(rule, create=False):
+    exe = rule.get("exe") or ""
+    key = _adapter_key(rule)
+    if is_firefox(exe):
+        return firefox_profile_dir(key, create=create)
+    if is_chromium_like(exe):
+        return chromium_profile_dir(exe, key, create=create)
+    return ""
+
+
+def is_rule_running(rule):
+    """True only if THIS rule's instance is running, not some other Chrome window."""
+    exe = (rule or {}).get("exe") or ""
+    if not exe:
+        return False
+    if rule_uses_isolated_profile(rule):
+        marker = isolated_profile_path(rule, create=False)
+        return bool(marker and list_pids_with_marker(exe, marker))
+    return is_exe_running(exe)
+
+
+def list_pids_with_marker(exe_path, marker):
+    import psutil
+    if not exe_path or not marker:
+        return []
+    base = os.path.basename(exe_path).lower()
+    needle = os.path.normcase(marker)
+    pids = []
+    for p in psutil.process_iter(["pid", "name"]):
+        try:
+            if (p.info.get("name") or "").lower() != base:
+                continue
+            cmd = " ".join(p.cmdline() or [])
+            if needle.lower() in os.path.normcase(cmd).lower():
+                pids.append(p.info["pid"])
+        except (psutil.Error, OSError, ValueError):
+            continue
+    return pids
+
+
+def stop_rule_processes(rule, timeout=8):
+    """Stop only the processes that belong to this rule."""
+    exe = (rule or {}).get("exe") or ""
+    if not exe:
+        return []
+    if rule_uses_isolated_profile(rule):
+        marker = isolated_profile_path(rule, create=False)
+        return close_by_cmdline_marker(exe, marker, timeout=timeout)
+    return close_by_exe(exe, timeout=timeout)
+
+
 def is_exe_running(exe_path):
     if not exe_path:
         return False
@@ -429,14 +497,17 @@ def chromium_proxy_args(socks_port, user_data_dir=None):
         "--proxy-bypass-list=<-loopback>;localhost;127.0.0.1",
     ]
     if user_data_dir:
-        args.append('--user-data-dir="%s"' % user_data_dir)
+        if any(ch.isspace() for ch in user_data_dir):
+            args.append('--user-data-dir="%s"' % user_data_dir)
+        else:
+            args.append("--user-data-dir=%s" % user_data_dir)
         args.append("--no-first-run")
         args.append("--no-default-browser-check")
         args.append("--disable-sync")
     return args
 
 
-def chromium_profile_dir(exe_path, adapter_key):
+def chromium_profile_dir(exe_path, adapter_key, create=True):
     base = os.path.splitext(os.path.basename(exe_path or "browser"))[0]
     safe = "".join(ch if ch.isalnum() else "_" for ch in base)
     key = "".join(ch if ch.isalnum() else "_" for ch in (adapter_key or "nic"))[:40]
@@ -444,14 +515,16 @@ def chromium_profile_dir(exe_path, adapter_key):
         os.environ.get("APPDATA", "."), "SplitNIC", "browser-profiles",
         "%s_%s" % (safe, key),
     )
-    os.makedirs(path, exist_ok=True)
+    if create:
+        os.makedirs(path, exist_ok=True)
     return path
 
 
-def firefox_profile_dir(adapter_key):
+def firefox_profile_dir(adapter_key, create=True):
     root = os.path.join(os.environ.get("APPDATA", "."), "SplitNIC", "firefox-profiles")
     path = os.path.join(root, adapter_key)
-    os.makedirs(path, exist_ok=True)
+    if create:
+        os.makedirs(path, exist_ok=True)
     return path
 
 

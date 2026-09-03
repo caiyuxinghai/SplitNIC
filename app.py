@@ -34,7 +34,10 @@ from tkinter import filedialog, messagebox
 
 from adapters import usable_adapters, list_adapters, find_adapter, public_ip_via, KIND_LABELS
 from socks_proxy import ProxyPool
-from launcher import launch_app, list_running_processes, dll_path, guess_mode, is_exe_running, close_by_exe
+from launcher import (
+    launch_app, list_running_processes, dll_path, guess_mode,
+    is_rule_running, stop_rule_processes,
+)
 from diagnose import run_selftest
 from winutil import (
     ensure_single_instance, create_desktop_shortcuts, set_start_with_windows,
@@ -527,6 +530,10 @@ class SplitNICApp(ctk.CTk):
         self.var_tray = ctk.BooleanVar(value=bool(s.get("minimize_to_tray", True)))
         self.var_auto = ctk.BooleanVar(value=bool(s.get("auto_refresh", True)))
         self.var_boot = ctk.BooleanVar(value=bool(s.get("start_with_windows", False) or is_start_with_windows()))
+        self.var_nic_launch = ctk.BooleanVar(value=bool(s.get("auto_launch_on_nic", True)))
+        self.var_kill_down = ctk.BooleanVar(value=bool(s.get("kill_on_nic_down", True)))
+        self.var_wait_nic = ctk.BooleanVar(value=bool(s.get("launch_wait_nic", True)))
+        self.var_iso_browser = ctk.BooleanVar(value=bool(s.get("isolated_browser_profile", True)))
 
         ctk.CTkCheckBox(wrap, text="关闭窗口时最小化到托盘（托盘图标退出才真正关掉）",
                         variable=self.var_tray, command=self._save_settings).pack(anchor="w", pady=6)
@@ -534,16 +541,12 @@ class SplitNICApp(ctk.CTk):
                         variable=self.var_auto, command=self._save_settings).pack(anchor="w", pady=6)
         ctk.CTkCheckBox(wrap, text="开机自动启动（管理员；启动后按规则自动拉起勾了「自动启动」的软件）",
                         variable=self.var_boot, command=self._toggle_autostart).pack(anchor="w", pady=6)
-        self.var_nic_launch = ctk.BooleanVar(value=bool(s.get("auto_launch_on_nic", True)))
         ctk.CTkCheckBox(wrap, text="网卡重新连上后，自动启动绑在这张卡上、且当时没在运行的软件",
                         variable=self.var_nic_launch, command=self._save_settings).pack(anchor="w", pady=6)
-        self.var_kill_down = ctk.BooleanVar(value=bool(s.get("kill_on_nic_down", True)))
         ctk.CTkCheckBox(wrap, text="网卡掉线时结束绑在该卡上的软件，防止 WorkBuddy/VPN 改走 Wi-Fi",
                         variable=self.var_kill_down, command=self._save_settings).pack(anchor="w", pady=6)
-        self.var_wait_nic = ctk.BooleanVar(value=bool(s.get("launch_wait_nic", True)))
         ctk.CTkCheckBox(wrap, text="自动启动时先等网卡拿到 IPv4（最多 90 秒），避免开机 DHCP 没完成",
                         variable=self.var_wait_nic, command=self._save_settings).pack(anchor="w", pady=6)
-        self.var_iso_browser = ctk.BooleanVar(value=bool(s.get("isolated_browser_profile", True)))
         ctk.CTkCheckBox(wrap, text="浏览器用独立配置目录（默认；不关掉你正在用的 Chrome）",
                         variable=self.var_iso_browser, command=self._save_settings).pack(anchor="w", pady=6)
 
@@ -559,13 +562,20 @@ class SplitNICApp(ctk.CTk):
 
     def _save_settings(self):
         s = self._settings()
-        s["minimize_to_tray"] = bool(self.var_tray.get())
-        s["auto_refresh"] = bool(self.var_auto.get())
-        s["start_with_windows"] = bool(self.var_boot.get())
-        s["auto_launch_on_nic"] = bool(self.var_nic_launch.get())
-        s["kill_on_nic_down"] = bool(self.var_kill_down.get())
-        s["launch_wait_nic"] = bool(self.var_wait_nic.get())
-        s["isolated_browser_profile"] = bool(self.var_iso_browser.get())
+        mapping = (
+            ("var_tray", "minimize_to_tray"),
+            ("var_auto", "auto_refresh"),
+            ("var_boot", "start_with_windows"),
+            ("var_nic_launch", "auto_launch_on_nic"),
+            ("var_kill_down", "kill_on_nic_down"),
+            ("var_wait_nic", "launch_wait_nic"),
+            ("var_iso_browser", "isolated_browser_profile"),
+        )
+        for attr, key in mapping:
+            var = getattr(self, attr, None)
+            if var is None:
+                continue
+            s[key] = bool(var.get())
         save_config(self.config_data)
 
     def _toggle_autostart(self):
@@ -760,7 +770,7 @@ class SplitNICApp(ctk.CTk):
                      text_color=nic_color).pack(side="left")
         ctk.CTkLabel(row, text=MODE_LABELS.get(rule.get("mode") or "auto", "自动"),
                      width=80, anchor="w", font=self.font).pack(side="left")
-        running = is_exe_running(rule.get("exe") or "")
+        running = is_rule_running(rule)
         ctk.CTkLabel(row, text="运行中" if running else "未运行", width=60, anchor="w",
                      font=self.font_small, text_color="#22c55e" if running else "gray").pack(side="left")
         info = self._egress.get(rule.get("id") or "")
@@ -888,7 +898,7 @@ class SplitNICApp(ctk.CTk):
                 continue
             if only_auto and not r.get("auto_launch", True):
                 continue
-            if skip_running and is_exe_running(r.get("exe") or ""):
+            if skip_running and is_rule_running(r):
                 self.log("跳过已在运行：%s" % r.get("name"))
                 continue
             rules.append(r)
@@ -904,55 +914,60 @@ class SplitNICApp(ctk.CTk):
     def _kick_queue(self):
         if self._busy or not self._queue:
             return
-        rule, quiet = self._queue.pop(0)
-        adapter = self._resolve_adapter(rule)
-        if not adapter or not adapter.get("up") or not adapter.get("ipv4"):
-            wait = quiet and self._settings().get("launch_wait_nic", True)
-            rid = rule.get("id") or rule.get("name") or ""
-            if wait:
+        wait_enabled = bool(self._settings().get("launch_wait_nic", True))
+        limit = float(self._settings().get("launch_wait_seconds") or 90)
+        now = time.time()
+        deferred = []
+        launched = False
+        while self._queue and not launched:
+            rule, quiet = self._queue.pop(0)
+            adapter = self._resolve_adapter(rule)
+            if (not adapter or not adapter.get("up") or not adapter.get("ipv4")) and quiet and wait_enabled:
                 try:
                     self.adapters = usable_adapters()
                 except Exception:
                     pass
                 adapter = self._resolve_adapter(rule)
             if not adapter or not adapter.get("up") or not adapter.get("ipv4"):
-                if wait:
-                    now = time.time()
+                rid = rule.get("id") or rule.get("name") or ""
+                if quiet and wait_enabled:
                     first = self._wait_since.get(rid, now)
                     self._wait_since[rid] = first
-                    limit = float(self._settings().get("launch_wait_seconds") or 90)
                     if now - first < limit:
-                        self.log("等待网卡就绪：%s（%.0f 秒内）…" % (rule.get("name"), limit - (now - first)))
-                        self._queue.append((rule, quiet))
-                        self.after(2000, self._kick_queue)
-                        return
+                        deferred.append((rule, quiet))
+                        continue
                     self._wait_since.pop(rid, None)
                 msg = "规则「%s」指定的网卡当前不可用。" % rule.get("name")
                 self.log(msg)
                 if not quiet:
                     messagebox.showerror(APP_NAME, msg + "请连接该网卡后刷新。")
-                self.after(50, self._kick_queue)
-                return
-        self._wait_since.pop(rule.get("id") or "", None)
-        mode = rule.get("mode") or "auto"
-        resolved = mode if mode != "auto" else guess_mode(rule.get("exe") or "")
-        if not is_admin() and resolved == "bind":
-            self.log("未提权：仍尝试网卡绑定。若启动失败，请点右上角「获取管理员权限」。")
+                continue
+            self._wait_since.pop(rule.get("id") or rule.get("name") or "", None)
+            mode = rule.get("mode") or "auto"
+            resolved = mode if mode != "auto" else guess_mode(rule.get("exe") or "")
+            if not is_admin() and resolved == "bind":
+                self.log("未提权：仍尝试网卡绑定。若启动失败，请点右上角「获取管理员权限」。")
 
-        def work():
-            self._busy = True
-            try:
-                self._launch_one(rule)
-            except Exception as exc:
-                self.log("启动失败：%s" % exc)
-                err = str(exc)
-                if not quiet:
-                    self.after(0, lambda: messagebox.showerror(APP_NAME, "启动失败：\n%s" % err))
-            finally:
-                self._busy = False
-                self.after(80, self._kick_queue)
+            def work(rule=rule, quiet=quiet):
+                self._busy = True
+                try:
+                    self._launch_one(rule)
+                except Exception as exc:
+                    self.log("启动失败：%s" % exc)
+                    err = str(exc)
+                    if not quiet:
+                        self.after(0, lambda: messagebox.showerror(APP_NAME, "启动失败：\n%s" % err))
+                finally:
+                    self._busy = False
+                    self.after(80, self._kick_queue)
 
-        threading.Thread(target=work, daemon=True).start()
+            threading.Thread(target=work, daemon=True).start()
+            launched = True
+        self._queue = deferred + self._queue
+        if deferred and not launched:
+            names = "、".join((r.get("name") or "") for r, _q in deferred)
+            self.log("等待网卡就绪：%s（最多 %.0f 秒）…" % (names, limit))
+            self.after(2000, self._kick_queue)
 
     def _find_rule(self, rule_id):
         for r in self.config_data.get("rules") or []:
@@ -973,7 +988,7 @@ class SplitNICApp(ctk.CTk):
             adapter = self._resolve_adapter(rule)
             if not adapter or adapter.get("guid") != guid:
                 continue
-            if is_exe_running(rule.get("exe") or ""):
+            if is_rule_running(rule):
                 self.log("  %s 已在运行，跳过" % rule.get("name"))
                 continue
             self.log("  自动启动 %s" % rule.get("name"))
@@ -992,10 +1007,10 @@ class SplitNICApp(ctk.CTk):
             if rule.get("adapter_guid") != guid:
                 continue
             exe = rule.get("exe") or ""
-            if not exe or not is_exe_running(exe):
+            if not exe or not is_rule_running(rule):
                 continue
             try:
-                killed = close_by_exe(exe)
+                killed = stop_rule_processes(rule)
             except Exception as exc:
                 self.log("结束 %s 失败：%s" % (rule.get("name"), exc))
                 continue
