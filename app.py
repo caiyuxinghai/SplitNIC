@@ -787,14 +787,16 @@ class SplitNICApp(CTkRoot):
                 self.log("读取网卡失败：%s" % exc)
             self.adapters = []
             all_nics = []
-        sig = tuple((a.get("guid"), a.get("up"), tuple(a.get("ipv4") or [])) for a in self.adapters)
+        sig = tuple(
+            (a.get("guid"), a.get("up"), tuple(a.get("ipv4") or []), a.get("network_name") or "")
+            for a in self.adapters
+        )
         changed = sig != self._nic_sig
         self._nic_sig = sig
         if not silent or changed:
             self._render_nic_cards()
             self._render_nic_details(all_nics)
-            if changed and silent:
-                self.render_rules()
+            self.render_rules()
         new_up = set(
             a.get("guid") for a in self.adapters
             if a.get("up") and a.get("ipv4") and a.get("guid")
@@ -816,7 +818,7 @@ class SplitNICApp(CTkRoot):
         if len(up) < 2:
             self.log("当前已连接且有 IPv4 的网卡不足 2 张。请同时连接有线网和无线网（或 VPN）后再刷新。")
         else:
-            names = "、".join("%s(%s)" % (a["name"], a["kind_label"]) for a in up)
+            names = "、".join("%s(%s)" % (a.get("network_name") or a["name"], a["kind_label"]) for a in up)
             self.log("检测到 %d 张可用网卡：%s" % (len(up), names))
 
     def _render_nic_cards(self):
