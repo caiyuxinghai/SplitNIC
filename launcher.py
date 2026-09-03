@@ -224,6 +224,40 @@ def list_running_processes():
     return rows
 
 
+def close_by_cmdline_marker(exe_path, marker, timeout=8):
+    """Terminate processes of this exe whose command line contains marker (e.g. our profile dir)."""
+    import psutil
+    if not exe_path or not marker:
+        return []
+    base = os.path.basename(exe_path).lower()
+    needle = os.path.normcase(marker)
+    killed = []
+    for p in psutil.process_iter(["pid", "name"]):
+        try:
+            if (p.info.get("name") or "").lower() != base:
+                continue
+            cmd = " ".join(p.cmdline() or [])
+            if needle.lower() not in os.path.normcase(cmd).lower():
+                continue
+            p.terminate()
+            killed.append(p.pid)
+        except (psutil.Error, OSError, ValueError):
+            continue
+    deadline = time.time() + timeout
+    while time.time() < deadline and killed:
+        still = [pid for pid in killed if psutil.pid_exists(pid)]
+        if not still:
+            break
+        time.sleep(0.2)
+    for pid in killed:
+        try:
+            if psutil.pid_exists(pid):
+                psutil.Process(pid).kill()
+        except Exception:
+            pass
+    return killed
+
+
 def close_by_exe(exe_path, timeout=8):
     import psutil
     target = os.path.normcase(os.path.abspath(exe_path))
@@ -386,14 +420,32 @@ def launch_plain(exe_path, args, workdir, extra_env=None):
     return pid
 
 
-def chromium_proxy_args(socks_port):
+def chromium_proxy_args(socks_port, user_data_dir=None):
     # Do NOT use MAP * ~NOTFOUND — that makes Chrome show "no internet"
     # when the SOCKS handshake is even slightly off. TCP still leaves via
     # the bound NIC; DNS may use the system resolver (documented limitation).
-    return [
+    args = [
         "--proxy-server=socks5://127.0.0.1:%s" % socks_port,
         "--proxy-bypass-list=<-loopback>;localhost;127.0.0.1",
     ]
+    if user_data_dir:
+        args.append('--user-data-dir="%s"' % user_data_dir)
+        args.append("--no-first-run")
+        args.append("--no-default-browser-check")
+        args.append("--disable-sync")
+    return args
+
+
+def chromium_profile_dir(exe_path, adapter_key):
+    base = os.path.splitext(os.path.basename(exe_path or "browser"))[0]
+    safe = "".join(ch if ch.isalnum() else "_" for ch in base)
+    key = "".join(ch if ch.isalnum() else "_" for ch in (adapter_key or "nic"))[:40]
+    path = os.path.join(
+        os.environ.get("APPDATA", "."), "SplitNIC", "browser-profiles",
+        "%s_%s" % (safe, key),
+    )
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 def firefox_profile_dir(adapter_key):
@@ -441,7 +493,12 @@ def launch_app(rule, adapter, proxy_pool, log=lambda m: None):
     if not bind_ip or not if_index:
         raise RuntimeError("网卡 %s 没有可用的 IPv4 地址，无法分流。" % adapter.get("name"))
 
-    if rule.get("close_existing"):
+    isolated = bool(rule.get("isolated_profile", True))
+    use_isolated_browser = isolated and (
+        is_firefox(exe) or is_chromium_like(exe)
+    ) and mode == "proxy"
+
+    if rule.get("close_existing") and not use_isolated_browser:
         killed = close_by_exe(exe)
         if killed:
             log("已结束旧进程 PID %s" % ", ".join(str(x) for x in killed))
@@ -465,7 +522,16 @@ def launch_app(rule, adapter, proxy_pool, log=lambda m: None):
             extra_args = ["-profile", '"%s"' % profile, "-no-remote"]
             log("Firefox 使用独立配置目录（书签与日常配置不共用）")
         elif is_chromium_like(exe):
-            extra_args = chromium_proxy_args(proxy.socks_port)
+            profile = None
+            if isolated:
+                key = "".join(ch if ch.isalnum() else "_" for ch in (adapter.get("guid") or str(if_index)))
+                profile = chromium_profile_dir(exe, key)
+                killed = close_by_cmdline_marker(exe, profile)
+                if killed:
+                    log("已结束本分流配置下的旧窗口 PID %s" % ", ".join(str(x) for x in killed))
+                    time.sleep(0.3)
+                log("浏览器独立配置：%s（不影响你日常的 Chrome/Edge）" % profile)
+            extra_args = chromium_proxy_args(proxy.socks_port, profile)
         if extra_args:
             args = (args + " " + " ".join(extra_args)).strip()
         pid = launch_plain(exe, args, workdir, extra_env=extra_env)

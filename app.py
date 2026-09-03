@@ -9,6 +9,7 @@ import os
 import sys
 import json
 import uuid
+import time
 import ctypes
 import threading
 import traceback
@@ -33,7 +34,7 @@ from tkinter import filedialog, messagebox
 
 from adapters import usable_adapters, list_adapters, find_adapter, public_ip_via, KIND_LABELS
 from socks_proxy import ProxyPool
-from launcher import launch_app, list_running_processes, dll_path, guess_mode, is_exe_running
+from launcher import launch_app, list_running_processes, dll_path, guess_mode, is_exe_running, close_by_exe
 from diagnose import run_selftest
 from winutil import (
     ensure_single_instance, create_desktop_shortcuts, set_start_with_windows,
@@ -88,8 +89,10 @@ HELP_TEXT = """\
   · 带反作弊的游戏往往会拒绝 DLL 注入，请不要对这类程序使用「网卡绑定」。
   · 启动后规则上会显示「出口 x.x.x.x」，那是这张网卡测到的公网 IP，用来确认有没有走对。
   · 开机启动会带上「按规则自动拉起软件」。网卡重新插上后，也会自动启动勾了「自动启动」且当时没在运行的软件。
-  · Chrome / Edge / 抖音 是单实例程序：启动前请勾选「先关闭已运行的同名进程」，否则新进程只会附到旧进程上，代理参数无效。
-  · Firefox 代理模式会使用独立配置目录，和你日常的书签/登录不是同一套。
+  · Chrome / Edge / 抖音默认使用独立配置目录，和日常浏览器分开，不必先关掉你正在用的那个。
+  · 绑定网卡掉线时，默认会结束对应软件，避免 WorkBuddy / VPN 悄悄改走 Wi-Fi。
+  · 开机自动拉起会等到网卡拿到 IPv4（最多约 90 秒），避免 DHCP 还没完成就启动失败。
+  · Firefox 代理模式同样使用独立配置目录，和日常书签/登录不是同一套。
   · 32 位程序无法使用当前的 64 位绑定模块，请改用代理模式或 64 位版本。
   · 部分杀毒软件会拦截注入，请把 SplitNIC 和 BindHook.dll 加入信任列表。
   · DNS 仍可能从「默认网卡」出去（DNS 泄漏）。若两个网络的 DNS 策略不同，请在网卡属性里各自填写 DNS，或关掉不用的网卡的 IPv6。
@@ -146,6 +149,10 @@ def _apply_setting_defaults(settings):
     settings.setdefault("start_with_windows", False)
     settings.setdefault("auto_refresh", True)
     settings.setdefault("auto_launch_on_nic", True)
+    settings.setdefault("kill_on_nic_down", True)
+    settings.setdefault("launch_wait_nic", True)
+    settings.setdefault("launch_wait_seconds", 90)
+    settings.setdefault("isolated_browser_profile", True)
     return settings
 
 
@@ -171,6 +178,8 @@ def new_rule(**kwargs):
         "close_existing": True,
         "enabled": True,
         "auto_launch": True,
+        "kill_on_down": True,
+        "isolated_profile": True,
     }
     rule.update(kwargs)
     return rule
@@ -242,7 +251,7 @@ class RuleEditor(ctk.CTkToplevel):
         self.rule = dict(rule)
         self.on_save = on_save
         self.title("编辑分流规则" if rule.get("exe") else "添加软件")
-        self.geometry("620x620")
+        self.geometry("620x680")
         self.transient(master)
         self.grab_set()
 
@@ -298,7 +307,13 @@ class RuleEditor(ctk.CTkToplevel):
                         variable=self.var_close).pack(anchor="w", padx=18, pady=(14, 4))
         self.var_auto = ctk.BooleanVar(value=bool(rule.get("auto_launch", True)))
         ctk.CTkCheckBox(self, text="开机 / 这张网卡重新连上时，若软件没在运行则自动启动",
-                        variable=self.var_auto).pack(anchor="w", padx=18, pady=(4, 10))
+                        variable=self.var_auto).pack(anchor="w", padx=18, pady=(4, 4))
+        self.var_kill = ctk.BooleanVar(value=bool(rule.get("kill_on_down", True)))
+        ctk.CTkCheckBox(self, text="这张网卡掉线时结束此软件，防止改走别的网",
+                        variable=self.var_kill).pack(anchor="w", padx=18, pady=(4, 4))
+        self.var_iso = ctk.BooleanVar(value=bool(rule.get("isolated_profile", True)))
+        ctk.CTkCheckBox(self, text="浏览器用独立配置（不关掉你日常的 Chrome/Edge/抖音）",
+                        variable=self.var_iso).pack(anchor="w", padx=18, pady=(4, 10))
 
         self.e_name.insert(0, rule.get("name") or "")
         self.e_exe.insert(0, rule.get("exe") or "")
@@ -346,6 +361,8 @@ class RuleEditor(ctk.CTkToplevel):
             "mode": mode,
             "close_existing": bool(self.var_close.get()),
             "auto_launch": bool(self.var_auto.get()),
+            "kill_on_down": bool(self.var_kill.get()),
+            "isolated_profile": bool(self.var_iso.get()),
         })
         self.on_save(self.rule)
         self.destroy()
@@ -379,6 +396,8 @@ class SplitNICApp(ctk.CTk):
         self._start_minimized = bool(start_minimized)
         self._boot_done = False
         self._queue = []
+        self._wait_since = {}
+        self._started_at = time.time()
 
         self.font_title = ctk.CTkFont(family="Microsoft YaHei UI", size=22, weight="bold")
         self.font_h = ctk.CTkFont(family="Microsoft YaHei UI", size=15, weight="bold")
@@ -518,6 +537,15 @@ class SplitNICApp(ctk.CTk):
         self.var_nic_launch = ctk.BooleanVar(value=bool(s.get("auto_launch_on_nic", True)))
         ctk.CTkCheckBox(wrap, text="网卡重新连上后，自动启动绑在这张卡上、且当时没在运行的软件",
                         variable=self.var_nic_launch, command=self._save_settings).pack(anchor="w", pady=6)
+        self.var_kill_down = ctk.BooleanVar(value=bool(s.get("kill_on_nic_down", True)))
+        ctk.CTkCheckBox(wrap, text="网卡掉线时结束绑在该卡上的软件，防止 WorkBuddy/VPN 改走 Wi-Fi",
+                        variable=self.var_kill_down, command=self._save_settings).pack(anchor="w", pady=6)
+        self.var_wait_nic = ctk.BooleanVar(value=bool(s.get("launch_wait_nic", True)))
+        ctk.CTkCheckBox(wrap, text="自动启动时先等网卡拿到 IPv4（最多 90 秒），避免开机 DHCP 没完成",
+                        variable=self.var_wait_nic, command=self._save_settings).pack(anchor="w", pady=6)
+        self.var_iso_browser = ctk.BooleanVar(value=bool(s.get("isolated_browser_profile", True)))
+        ctk.CTkCheckBox(wrap, text="浏览器用独立配置目录（默认；不关掉你正在用的 Chrome）",
+                        variable=self.var_iso_browser, command=self._save_settings).pack(anchor="w", pady=6)
 
         ctk.CTkLabel(wrap, text="快捷方式", font=self.font_h).pack(anchor="w", pady=(18, 6))
         ctk.CTkButton(wrap, text="在桌面创建「网口分流」快捷方式", width=320,
@@ -535,6 +563,9 @@ class SplitNICApp(ctk.CTk):
         s["auto_refresh"] = bool(self.var_auto.get())
         s["start_with_windows"] = bool(self.var_boot.get())
         s["auto_launch_on_nic"] = bool(self.var_nic_launch.get())
+        s["kill_on_nic_down"] = bool(self.var_kill_down.get())
+        s["launch_wait_nic"] = bool(self.var_wait_nic.get())
+        s["isolated_browser_profile"] = bool(self.var_iso_browser.get())
         save_config(self.config_data)
 
     def _toggle_autostart(self):
@@ -625,6 +656,10 @@ class SplitNICApp(ctk.CTk):
             if a.get("up") and a.get("ipv4") and a.get("guid")
         )
         appeared = new_up - self._up_guids
+        disappeared = self._up_guids - new_up
+        if self._boot_done and disappeared and self._settings().get("kill_on_nic_down", True):
+            for guid in disappeared:
+                self._kill_for_guid(guid)
         if self._boot_done and appeared and self._settings().get("auto_launch_on_nic", True):
             for guid in appeared:
                 self._auto_launch_for_guid(guid)
@@ -813,6 +848,9 @@ class SplitNICApp(ctk.CTk):
         if not adapter or not adapter.get("up") or not adapter.get("ipv4"):
             raise RuntimeError("规则「%s」指定的网卡当前不可用。请连接该网卡后刷新。" % rule.get("name"))
         self.log("正在启动 %s …" % rule.get("name"))
+        if rule.get("isolated_profile") is None:
+            rule = dict(rule)
+            rule["isolated_profile"] = bool(self._settings().get("isolated_browser_profile", True))
         pid, method = launch_app(rule, adapter, self.proxy_pool, log=self.log)
         self.log("已启动 %s  PID %s  %s" % (rule.get("name"), pid, method))
         self._probe_egress(rule, adapter)
@@ -869,12 +907,33 @@ class SplitNICApp(ctk.CTk):
         rule, quiet = self._queue.pop(0)
         adapter = self._resolve_adapter(rule)
         if not adapter or not adapter.get("up") or not adapter.get("ipv4"):
-            msg = "规则「%s」指定的网卡当前不可用。" % rule.get("name")
-            self.log(msg)
-            if not quiet:
-                messagebox.showerror(APP_NAME, msg + "请连接该网卡后刷新。")
-            self.after(50, self._kick_queue)
-            return
+            wait = quiet and self._settings().get("launch_wait_nic", True)
+            rid = rule.get("id") or rule.get("name") or ""
+            if wait:
+                try:
+                    self.adapters = usable_adapters()
+                except Exception:
+                    pass
+                adapter = self._resolve_adapter(rule)
+            if not adapter or not adapter.get("up") or not adapter.get("ipv4"):
+                if wait:
+                    now = time.time()
+                    first = self._wait_since.get(rid, now)
+                    self._wait_since[rid] = first
+                    limit = float(self._settings().get("launch_wait_seconds") or 90)
+                    if now - first < limit:
+                        self.log("等待网卡就绪：%s（%.0f 秒内）…" % (rule.get("name"), limit - (now - first)))
+                        self._queue.append((rule, quiet))
+                        self.after(2000, self._kick_queue)
+                        return
+                    self._wait_since.pop(rid, None)
+                msg = "规则「%s」指定的网卡当前不可用。" % rule.get("name")
+                self.log(msg)
+                if not quiet:
+                    messagebox.showerror(APP_NAME, msg + "请连接该网卡后刷新。")
+                self.after(50, self._kick_queue)
+                return
+        self._wait_since.pop(rule.get("id") or "", None)
         mode = rule.get("mode") or "auto"
         resolved = mode if mode != "auto" else guess_mode(rule.get("exe") or "")
         if not is_admin() and resolved == "bind":
@@ -919,6 +978,42 @@ class SplitNICApp(ctk.CTk):
                 continue
             self.log("  自动启动 %s" % rule.get("name"))
             self.start_rule(rule, quiet=True)
+
+    def _kill_for_guid(self, guid):
+        nic_name = guid
+        for a in list_adapters(include_down=True, include_loopback=False):
+            if a.get("guid") == guid:
+                nic_name = a.get("name") or guid
+                break
+        stopped = []
+        for rule in self.config_data.get("rules") or []:
+            if not rule.get("kill_on_down", True):
+                continue
+            if rule.get("adapter_guid") != guid:
+                continue
+            exe = rule.get("exe") or ""
+            if not exe or not is_exe_running(exe):
+                continue
+            try:
+                killed = close_by_exe(exe)
+            except Exception as exc:
+                self.log("结束 %s 失败：%s" % (rule.get("name"), exc))
+                continue
+            if killed:
+                stopped.append(rule.get("name") or os.path.basename(exe))
+                self._egress[rule.get("id") or ""] = {"ip": None, "error": "网卡已掉线"}
+        if stopped:
+            msg = "网卡「%s」掉线，已停止：%s（防止改走别的网）" % (nic_name, "、".join(stopped))
+            self.log(msg)
+            self._tray_notify("网口分流", msg)
+            self.render_rules()
+
+    def _tray_notify(self, title, message):
+        try:
+            if self._tray:
+                self._tray.notify(message, title)
+        except Exception:
+            pass
 
     def _run_pending(self):
         cmds = list(self._pending_cmds)
@@ -1020,7 +1115,8 @@ class SplitNICApp(ctk.CTk):
         except Exception:
             pass
         if not self._quitting:
-            self.after(20000, self._schedule_auto_refresh)
+            interval = 3000 if (time.time() - self._started_at) < 120 else 20000
+            self.after(interval, self._schedule_auto_refresh)
 
     def _start_tray(self):
         try:
